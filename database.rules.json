@@ -1,0 +1,67 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "field_officers": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "fieldOfficerSubmissions": {
+      ".indexOn": ["fieldOfficerId", "createdAt", "syncedAt"],
+      "$submissionId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!newData.child('fieldOfficerId').exists() || newData.child('fieldOfficerId').val() === auth.uid)"
+      }
+    },
+    "livestockFarmers": {
+      ".indexOn": ["fieldOfficerId", "createdAt", "updatedAt"],
+      "$farmerId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!newData.child('fieldOfficerId').exists() || newData.child('fieldOfficerId').val() === auth.uid)"
+      }
+    },
+    "livestock_farmers": {
+      ".indexOn": ["fieldOfficerId", "createdAt", "updatedAt"],
+      "$farmerId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!newData.child('fieldOfficerId').exists() || newData.child('fieldOfficerId').val() === auth.uid)"
+      }
+    },
+    "farmers": {
+      ".indexOn": ["fieldOfficerId", "createdAt", "updatedAt"],
+      "$farmerId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!newData.child('fieldOfficerId').exists() || newData.child('fieldOfficerId').val() === auth.uid)"
+      }
+    },
+    "submissions": {
+      ".indexOn": ["fieldOfficerId", "createdAt", "syncedAt"],
+      "$submissionId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!newData.child('fieldOfficerId').exists() || newData.child('fieldOfficerId').val() === auth.uid)"
+      }
+    },
+    "admins": {
+      ".indexOn": ["email"]
+    },
+    "tenants": {
+      ".indexOn": ["email"],
+      "$tenantId": {
+        "customers": {
+          ".indexOn": ["phone", "status", "expiry_date"]
+        },
+        "packages": {
+          ".indexOn": ["name"]
+        },
+        "payments": {
+          ".indexOn": ["paid_at", "status", "phone"]
+        }
+      }
+    },
+    "admin_audit_logs": {
+      ".indexOn": ["timestamp", "admin_email", "action"]
+    }
+  }
+}

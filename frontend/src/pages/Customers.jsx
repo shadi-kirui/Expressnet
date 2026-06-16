@@ -1,0 +1,448 @@
+import { CreditCard, Download, Pause, Pencil, PlugZap, Plus, RefreshCw, Router, Search, Trash2, Users, Wifi } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import toast from 'react-hot-toast';
+import api from '../api/axios';
+import Modal from '../components/Modal';
+import StatusBadge from '../components/StatusBadge';
+
+const initialForm = {
+  name: '',
+  phone: '',
+  username: '',
+  password: '',
+  package_name: '',
+  provision_mikrotik: true,
+};
+
+function toDate(value) {
+  if (!value) return null;
+  if (value._seconds) return new Date(value._seconds * 1000);
+  if (value.seconds) return new Date(value.seconds * 1000);
+  return new Date(value);
+}
+
+function formatDate(value) {
+  const date = toDate(value);
+  return date && !Number.isNaN(date.valueOf()) ? date.toLocaleDateString() : '-';
+}
+
+export default function Customers() {
+  const [customers, setCustomers] = useState([]);
+  const [packages, setPackages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [payingId, setPayingId] = useState(null);
+  const [provisioningId, setProvisioningId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [form, setForm] = useState(initialForm);
+  const [errors, setErrors] = useState({});
+  const [editingId, setEditingId] = useState(null);
+
+  const packageMap = useMemo(() => {
+    return packages.reduce((map, item) => {
+      map[item.name] = item;
+      return map;
+    }, {});
+  }, [packages]);
+
+  const userStats = useMemo(() => {
+    const active = customers.filter((customer) => customer.status === 'active').length;
+    const hotspot = customers.filter((customer) => (customer.service_type || 'pppoe') === 'hotspot').length;
+    const pppoe = customers.filter((customer) => (customer.service_type || 'pppoe') === 'pppoe').length;
+    const paused = customers.filter((customer) => ['paused', 'suspended', 'inactive'].includes(String(customer.status || '').toLowerCase())).length;
+    const offline = customers.filter((customer) => ['offline', 'expired'].includes(String(customer.status || '').toLowerCase())).length;
+    return {
+      total: customers.length,
+      active,
+      inactive: customers.length - active,
+      hotspot,
+      pppoe,
+      paused,
+      offline,
+    };
+  }, [customers]);
+
+  const filteredCustomers = useMemo(() => {
+    return customers.filter((customer) => {
+      const isActive = customer.status === 'active';
+      if (statusFilter === 'active' && !isActive) return false;
+      if (statusFilter === 'inactive' && isActive) return false;
+      if (statusFilter === 'hotspot' && (customer.service_type || 'pppoe') !== 'hotspot') return false;
+      if (statusFilter === 'pppoe' && (customer.service_type || 'pppoe') !== 'pppoe') return false;
+      if (statusFilter === 'paused' && !['paused', 'suspended', 'inactive'].includes(String(customer.status || '').toLowerCase())) return false;
+      if (statusFilter === 'offline' && !['offline', 'expired'].includes(String(customer.status || '').toLowerCase())) return false;
+      const haystack = `${customer.name || ''} ${customer.phone || ''} ${customer.username || ''} ${customer.package || ''}`.toLowerCase();
+      return haystack.includes(search.toLowerCase());
+    });
+  }, [customers, search, statusFilter]);
+
+  const userFilterTabs = useMemo(() => ([
+    ['all', 'All', userStats.total, Users],
+    ['hotspot', 'Hotspot', userStats.hotspot, Wifi],
+    ['pppoe', 'PPPoE', userStats.pppoe, CreditCard],
+    ['paused', 'Paused', userStats.paused, Pause],
+    ['offline', 'Offline', userStats.offline, PlugZap],
+  ]), [userStats]);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const [customerRes, packageRes] = await Promise.all([
+        api.get('/customers?all=1'),
+        api.get('/packages?all=1'),
+      ]);
+      setCustomers(Array.isArray(customerRes.data) ? customerRes.data : customerRes.data.results || []);
+      setPackages(Array.isArray(packageRes.data) ? packageRes.data : packageRes.data.results || []);
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to load customers');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const update = (event) => {
+    const { name, type, checked, value } = event.target;
+    setForm((current) => ({ ...current, [name]: type === 'checkbox' ? checked : value }));
+    setErrors((current) => ({ ...current, [event.target.name]: '' }));
+  };
+
+  const validate = () => {
+    const nextErrors = {};
+    if (!form.name.trim()) nextErrors.name = 'Name is required';
+    if (!form.phone.trim()) nextErrors.phone = 'Phone is required';
+    if (!form.username.trim()) nextErrors.username = 'Username is required';
+    if (!editingId && !form.password.trim()) nextErrors.password = 'Password is required';
+    if (!form.package_name) nextErrors.package_name = 'Package is required';
+    setErrors(nextErrors);
+    return Object.keys(nextErrors).length === 0;
+  };
+
+  const closeModal = () => {
+    setModalOpen(false);
+    setEditingId(null);
+    setForm(initialForm);
+    setErrors({});
+  };
+
+  const addCustomer = async (event) => {
+    event.preventDefault();
+    if (!validate()) return;
+
+    setSaving(true);
+    try {
+      if (editingId) {
+        await api.patch(`/customers/${editingId}`, {
+          name: form.name,
+          phone: form.phone,
+          username: form.username,
+          package: form.package_name,
+          service_type: form.service_type || 'pppoe',
+        });
+        toast.success('Customer updated');
+      } else {
+        await api.post('/customers/add', form);
+        toast.success('Customer added');
+      }
+      closeModal();
+      await load();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to add customer');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const editCustomer = (customer) => {
+    setEditingId(customer.id);
+    setForm({
+      name: customer.name || '',
+      phone: customer.phone || '',
+      username: customer.username || '',
+      password: '',
+      package_name: customer.package || '',
+      provision_mikrotik: false,
+      service_type: customer.service_type || 'pppoe',
+    });
+    setModalOpen(true);
+  };
+
+  const renewCustomer = async (customer) => {
+    const packageName = window.prompt('Renew with package name', customer.package || packages[0]?.name || '');
+    if (!packageName) return;
+    const selected = packages.find((pkg) => pkg.name === packageName);
+    if (!selected) {
+      toast.error('Package not found');
+      return;
+    }
+    try {
+      await api.post(`/customers/${customer.id}/renew`, { package_id: selected.id });
+      toast.success('Customer renewed');
+      await load();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to renew customer');
+    }
+  };
+
+  const exportCsv = () => {
+    const headers = ['name', 'phone', 'username', 'package', 'service_type', 'status', 'expiry_date'];
+    const csv = [headers.join(','), ...filteredCustomers.map((item) => headers.map((key) => JSON.stringify(item[key] ?? '')).join(','))].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'users.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const expiryClass = (value) => {
+    const date = toDate(value);
+    if (!date || Number.isNaN(date.valueOf())) return 'text-slate-500';
+    const days = (date.getTime() - Date.now()) / 86400000;
+    if (days < 0) return 'text-red-600 font-semibold';
+    if (days <= 7) return 'text-amber-600 font-semibold';
+    return 'text-emerald-600 font-semibold';
+  };
+
+  const deleteCustomer = async (customer) => {
+    if (!window.confirm(`Delete ${customer.name}?`)) return;
+
+    setDeletingId(customer.id);
+    try {
+      await api.delete(`/customers/${customer.id}`);
+      setCustomers((current) => current.filter((item) => item.id !== customer.id));
+      toast.success('Customer deleted');
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to delete customer');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const startPayment = async (customer) => {
+    const selectedPackage = packageMap[customer.package];
+    setPayingId(customer.id);
+    try {
+      const { data } = await api.post('/payments/pay', {
+        customer_id: customer.id,
+        customer_name: customer.name,
+        phone: customer.phone,
+        amount: selectedPackage?.price,
+        package_name: customer.package,
+        service_type: 'pppoe',
+      });
+      if (data.authorizationUrl) {
+        window.open(data.authorizationUrl, '_blank', 'noopener,noreferrer');
+      }
+      toast.success('Paystack checkout created');
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to create Paystack checkout');
+    } finally {
+      setPayingId(null);
+    }
+  };
+
+  const provisionCustomer = async (customer) => {
+    setProvisioningId(customer.id);
+    try {
+      await api.post(`/customers/${customer.id}/provision`);
+      toast.success('Customer provisioned on MikroTik');
+      await load();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to provision customer');
+    } finally {
+      setProvisioningId(null);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="page-title">Users</h1>
+          <p className="page-subtitle">Manage PPPoE and Hotspot users from one page, with active and inactive filters.</p>
+        </div>
+        <div className="flex gap-2">
+          <button type="button" className="btn-secondary" onClick={exportCsv}>
+            <Download size={15} />
+            Export CSV
+          </button>
+          <button type="button" className="btn-primary" onClick={() => { setEditingId(null); setModalOpen(true); }}>
+            <Plus size={15} />
+            Add User
+          </button>
+        </div>
+      </div>
+
+      <section className="border-b border-slate-200">
+        <div className="flex flex-wrap gap-4">
+          {userFilterTabs.map(([key, label, count, Icon]) => {
+            const active = statusFilter === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                className={`flex h-10 items-center gap-2 border-b-2 px-0 text-xs font-normal transition ${
+                  active ? 'border-[#fa8200] text-[#c95f00]' : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+                onClick={() => setStatusFilter(key)}
+              >
+                <Icon size={16} className={active ? 'text-[#c95f00]' : 'text-slate-400'} />
+                <span>{label}</span>
+                <span className="rounded-md border border-orange-200 bg-orange-50 px-1.5 py-0.5 text-[10px] leading-none text-[#c95f00]">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="surface-card p-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <label className="relative block w-full lg:max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+            <input
+              className="form-input mt-0 pl-9"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search name, phone, username, package"
+            />
+          </label>
+          <div className="flex gap-4 text-xs text-slate-500">
+            <span>Active: <strong className="font-normal text-slate-900">{userStats.active}</strong></span>
+            <span>Inactive: <strong className="font-normal text-slate-900">{userStats.inactive}</strong></span>
+          </div>
+        </div>
+      </section>
+
+      <div className="table-shell overflow-x-auto">
+        <table className="min-w-[900px] divide-y divide-slate-200">
+          <thead className="table-head">
+            <tr>
+              <th className="px-3 py-2">Name</th>
+              <th className="px-3 py-2">Phone</th>
+              <th className="px-3 py-2">Username</th>
+              <th className="px-3 py-2">Package</th>
+              <th className="px-3 py-2">MikroTik</th>
+              <th className="px-3 py-2">Expiry</th>
+              <th className="px-3 py-2">Status</th>
+              <th className="sticky right-0 border-l border-slate-200 bg-slate-50 px-3 py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {loading ? (
+              <tr><td className="table-cell text-slate-500" colSpan="8">Loading customers...</td></tr>
+            ) : filteredCustomers.length === 0 ? (
+              <tr><td className="table-cell text-slate-500" colSpan="8">No customers found.</td></tr>
+            ) : filteredCustomers.map((customer) => (
+              <tr key={customer.id}>
+                <td className="table-cell px-3 font-medium text-slate-900">{customer.name}</td>
+                <td className="table-cell px-3">{customer.phone}</td>
+                <td className="table-cell px-3">{customer.username}</td>
+                <td className="table-cell px-3">{customer.package || '-'}</td>
+                <td className="table-cell px-3"><StatusBadge status={customer.provisioning_status || 'pending'} /></td>
+                <td className={`table-cell px-3 ${expiryClass(customer.expiry_date)}`}>{formatDate(customer.expiry_date)}</td>
+                <td className="table-cell px-3"><StatusBadge status={customer.status} /></td>
+                <td className="table-cell sticky right-0 border-l border-slate-200 bg-white px-3">
+                  <div className="flex flex-nowrap gap-2">
+                    <button type="button" className="btn-secondary" onClick={() => provisionCustomer(customer)} disabled={provisioningId === customer.id}>
+                      <Router size={16} />
+                      {provisioningId === customer.id ? 'Provisioning...' : 'Provision'}
+                    </button>
+                    <button type="button" className="btn-secondary" onClick={() => startPayment(customer)} disabled={payingId === customer.id}>
+                      <CreditCard size={16} />
+                      {payingId === customer.id ? 'Sending...' : 'Pay'}
+                    </button>
+                    <button type="button" className="btn-secondary" onClick={() => renewCustomer(customer)}>
+                      <RefreshCw size={16} />
+                      Renew
+                    </button>
+                    <button type="button" className="btn-secondary" onClick={() => editCustomer(customer)}>
+                      <Pencil size={16} />
+                      Edit
+                    </button>
+                    <button type="button" className="btn-danger" onClick={() => deleteCustomer(customer)} disabled={deletingId === customer.id}>
+                      <Trash2 size={16} />
+                      {deletingId === customer.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {modalOpen && (
+        <Modal title={editingId ? 'Edit Customer' : 'Add Customer'} onClose={closeModal}>
+          <form className="space-y-4" onSubmit={addCustomer}>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="form-label" htmlFor="name">Name</label>
+                <input id="name" name="name" className="form-input" value={form.name} onChange={update} />
+                {errors.name && <p className="form-error">{errors.name}</p>}
+              </div>
+              <div>
+                <label className="form-label" htmlFor="phone">Phone</label>
+                <input id="phone" name="phone" className="form-input" value={form.phone} onChange={update} />
+                {errors.phone && <p className="form-error">{errors.phone}</p>}
+              </div>
+              <div>
+                <label className="form-label" htmlFor="username">Username</label>
+                <input id="username" name="username" className="form-input" value={form.username} onChange={update} />
+                {errors.username && <p className="form-error">{errors.username}</p>}
+              </div>
+              {!editingId && <div>
+                <label className="form-label" htmlFor="password">Password</label>
+                <input id="password" name="password" type="password" className="form-input" value={form.password} onChange={update} />
+                {errors.password && <p className="form-error">{errors.password}</p>}
+              </div>}
+              <div className="sm:col-span-2">
+                <label className="form-label" htmlFor="package_name">Package</label>
+                <select id="package_name" name="package_name" className="form-input" value={form.package_name} onChange={update}>
+                  <option value="">Select a package</option>
+                  {packages.map((pkg) => (
+                    <option key={pkg.id} value={pkg.name}>{pkg.name}</option>
+                  ))}
+                </select>
+                {errors.package_name && <p className="form-error">{errors.package_name}</p>}
+              </div>
+              <label className="flex items-start gap-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 sm:col-span-2">
+                <input
+                  type="checkbox"
+                  name="provision_mikrotik"
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                  checked={form.provision_mikrotik}
+                  onChange={update}
+                />
+                <span>
+                  <span className="block font-semibold text-slate-800">Create this customer on MikroTik now</span>
+                  <span className="mt-1 block">
+                    This creates a PPPoE secret on MikroTik using the selected package/profile and keeps it disabled until payment.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            <div className="flex justify-end gap-3 border-t border-slate-200 pt-4">
+              <button type="button" className="btn-secondary" onClick={closeModal}>Cancel</button>
+              <button type="submit" className="btn-primary" disabled={saving}>
+                {saving ? (
+                  <>
+                    <RefreshCw size={16} className="animate-spin" />
+                    Saving...
+                  </>
+                ) : editingId ? 'Update Customer' : 'Save Customer'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}

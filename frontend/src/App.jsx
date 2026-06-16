@@ -1,0 +1,139 @@
+import { useEffect, useState } from 'react';
+import { Navigate, Route, Routes } from 'react-router-dom';
+import Navbar from './components/Navbar';
+import AdminLayout from './components/admin/AdminLayout';
+import AdminProtectedRoute from './components/admin/AdminProtectedRoute';
+import ProtectedRoute from './components/ProtectedRoute';
+import Sidebar from './components/Sidebar';
+import AdminAuditLog from './pages/admin/AdminAuditLog';
+import AdminDashboard from './pages/admin/AdminDashboard';
+import AdminLogin from './pages/admin/AdminLogin';
+import AdminSiteSettings from './pages/admin/AdminSiteSettings';
+import AdminSubscriptions from './pages/admin/AdminSubscriptions';
+import AdminSystem from './pages/admin/AdminSystem';
+import AdminTenantDetail from './pages/admin/AdminTenantDetail';
+import AdminTenants from './pages/admin/AdminTenants';
+import AdminUsers from './pages/admin/AdminUsers';
+import BusinessSettings from './pages/BusinessSettings';
+import Customers from './pages/Customers';
+import CustomerPortal from './pages/CustomerPortal';
+import Dashboard from './pages/Dashboard';
+import Emails from './pages/Emails';
+import Equipment from './pages/Equipment';
+import Expenses from './pages/Expenses';
+import Home from './pages/Home';
+import IspOperations from './pages/IspOperations';
+import Login from './pages/Login';
+import Messages from './pages/Messages';
+import MikrotikLink from './pages/MikrotikLink';
+import MikrotikSettings from './pages/MikrotikSettings';
+import NotFound from './pages/NotFound';
+import Packages from './pages/Packages';
+import Payments from './pages/Payments';
+import Profile from './pages/Profile';
+import Register from './pages/Register';
+import Reports from './pages/Reports';
+import Vouchers from './pages/Vouchers';
+
+function softenColor(color) {
+  const parts = [0, 2, 4].map((start) => parseInt(color.slice(1).slice(start, start + 2), 16));
+  return `#${parts.map((part) => Math.round(part * 0.85 + 32).toString(16).padStart(2, '0')).join('')}`;
+}
+
+function applyTenantTheme() {
+  try {
+    const settings = JSON.parse(localStorage.getItem('tenant_settings') || '{}');
+    const color = settings.themeColor;
+    if (/^#[0-9a-f]{6}$/i.test(color || '')) {
+      document.documentElement.style.setProperty('--dashboard-color', color);
+      document.documentElement.style.setProperty('--dashboard-color-soft', softenColor(color));
+    }
+    const mode = settings.themeMode || (settings.darkMode ? 'dark' : 'light');
+    const resolved = mode === 'system'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      : mode;
+    document.documentElement.dataset.theme = resolved === 'dark' ? 'dark' : 'light';
+  } catch {
+    document.documentElement.dataset.theme = 'light';
+  }
+}
+
+function DashboardLayout() {
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    applyTenantTheme();
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const listener = () => applyTenantTheme();
+    media.addEventListener('change', listener);
+    window.addEventListener('storage', listener);
+    return () => {
+      media.removeEventListener('change', listener);
+      window.removeEventListener('storage', listener);
+    };
+  }, []);
+
+  return (
+    <div className="theme-page min-h-screen w-full">
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <div className="min-h-screen w-full min-w-0 lg:ml-[240px] lg:w-[calc(100%-240px)]">
+        <Navbar onMenuClick={() => setSidebarOpen(true)} />
+        <main className="mx-auto w-full max-w-[1200px] px-4 py-4 sm:px-8 sm:py-5">
+          <Routes>
+            <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/customers" element={<Customers />} />
+            <Route path="/active-users" element={<Navigate to="/customers" replace />} />
+            <Route path="/tickets" element={<IspOperations module="tickets" />} />
+            <Route path="/packages" element={<Packages />} />
+            <Route path="/payments" element={<Payments />} />
+            <Route path="/vouchers" element={<Vouchers />} />
+            <Route path="/expenses" element={<Expenses />} />
+            <Route path="/reports" element={<Reports />} />
+            <Route path="/messages" element={<Messages />} />
+            <Route path="/emails" element={<Emails />} />
+            <Route path="/mikrotik" element={<MikrotikSettings />} />
+            <Route path="/mikrotik/link" element={<MikrotikLink />} />
+            <Route path="/equipment" element={<Equipment />} />
+            <Route path="/profile" element={<Profile />} />
+            <Route path="/settings" element={<BusinessSettings />} />
+            <Route path="/settings/expresswifi/edit" element={<BusinessSettings />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const isAdminHost = window.location.hostname.split('.')[0] === 'admin';
+
+  return (
+    <Routes>
+      <Route path="/" element={isAdminHost ? <Navigate to="/admin/login" replace /> : <Home />} />
+      <Route path="/login" element={<Login />} />
+      <Route path="/register" element={<Register />} />
+      <Route path="/portal/:tenantId" element={<CustomerPortal />} />
+      <Route path="/customers/:tenantId" element={<CustomerPortal />} />
+      <Route path="/customer/:tenantId" element={<CustomerPortal />} />
+      <Route path="/hotspot/:tenantId" element={<CustomerPortal />} />
+      <Route path="/admin/login" element={<AdminLogin />} />
+      <Route element={<AdminProtectedRoute />}>
+        <Route path="/admin" element={<AdminLayout />}>
+          <Route index element={<Navigate to="/admin/dashboard" replace />} />
+          <Route path="dashboard" element={<AdminDashboard />} />
+          <Route path="tenants" element={<AdminTenants />} />
+          <Route path="tenants/:id" element={<AdminTenantDetail />} />
+          <Route path="subscriptions" element={<AdminSubscriptions />} />
+          <Route path="users" element={<AdminUsers />} />
+          <Route path="site" element={<AdminSiteSettings />} />
+          <Route path="system" element={<AdminSystem />} />
+          <Route path="audit" element={<AdminAuditLog />} />
+        </Route>
+      </Route>
+      <Route element={<ProtectedRoute />}>
+        <Route path="/*" element={<DashboardLayout />} />
+      </Route>
+    </Routes>
+  );
+}

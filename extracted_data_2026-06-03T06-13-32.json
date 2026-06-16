@@ -1,0 +1,523 @@
+{
+  "target": {
+    "origin": "https://expresswifi.centipidtechnologies.com",
+    "currentUrl": "https://expresswifi.centipidtechnologies.com/",
+    "title": "Good morning, Expresswifi 🌅 - EXPRESS PLOT WIFI",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+  },
+  "metadata": {
+    "generatedBy": "browserscript.js",
+    "mode": "read-only-dom-assessment",
+    "maxPages": 30,
+    "startedAt": "2026-06-03T06:12:13.908Z",
+    "completedAt": "2026-06-03T06:13:32.787Z"
+  },
+  "visited": [
+    "https://expresswifi.centipidtechnologies.com/",
+    "https://expresswifi.centipidtechnologies.com/profile",
+    "https://expresswifi.centipidtechnologies.com/settings/expresswifi/edit",
+    "https://expresswifi.centipidtechnologies.com/centipid-subscriptions",
+    "https://expresswifi.centipidtechnologies.com/system-users",
+    "https://expresswifi.centipidtechnologies.com/audits",
+    "https://expresswifi.centipidtechnologies.com/referrals",
+    "https://expresswifi.centipidtechnologies.com/active-users",
+    "https://expresswifi.centipidtechnologies.com/users",
+    "https://expresswifi.centipidtechnologies.com/tickets",
+    "https://expresswifi.centipidtechnologies.com/leads",
+    "https://expresswifi.centipidtechnologies.com/packages",
+    "https://expresswifi.centipidtechnologies.com/payments",
+    "https://expresswifi.centipidtechnologies.com/vouchers",
+    "https://expresswifi.centipidtechnologies.com/expenses",
+    "https://expresswifi.centipidtechnologies.com/sms",
+    "https://expresswifi.centipidtechnologies.com/emails",
+    "https://expresswifi.centipidtechnologies.com/campaigns",
+    "https://expresswifi.centipidtechnologies.com/nas",
+    "https://expresswifi.centipidtechnologies.com/equipment",
+    "https://expresswifi.centipidtechnologies.com/legal"
+  ],
+  "pages": [
+    {
+      "url": "https://expresswifi.centipidtechnologies.com/",
+      "title": "Good morning, Expresswifi 🌅 - EXPRESS PLOT WIFI",
+      "timestamp": "2026-06-03T06:12:13.963Z",
+      "metaDescription": "",
+      "ogTitle": "",
+      "navLinks": [
+        {
+          "text": "EXPRESS PLOT WIFI",
+          "href": "https://expresswifi.centipidtechnologies.com/",
+          "path": "/"
+        },
+        {
+          "text": "2FA Settings",
+          "href": "https://expresswifi.centipidtechnologies.com/profile",
+          "path": "/profile"
+        },
+        {
+          "text": "Settings",
+          "href": "https://expresswifi.centipidtechnologies.com/settings/expresswifi/edit",
+          "path": "/settings/expresswifi/edit"
+        },
+        {
+          "text": "Billing & Subscription",
+          "href": "https://expresswifi.centipidtechnologies.com/centipid-subscriptions",
+          "path": "/centipid-subscriptions"
+        },
+        {
+          "text": "System users",
+          "href": "https://expresswifi.centipidtechnologies.com/system-users",
+          "path": "/system-users"
+        },
+        {
+          "text": "System logs",
+          "href": "https://expresswifi.centipidtechnologies.com/audits",
+          "path": "/audits"
+        },
+        {
+          "text": "Refer a friend",
+          "href": "https://expresswifi.centipidtechnologies.com/referrals",
+          "path": "/referrals"
+        },
+        {
+          "text": "Active Users\n0",
+          "href": "https://expresswifi.centipidtechnologies.com/active-users",
+          "path": "/active-users"
+        },
+        {
+          "text": "Users\n701",
+          "href": "https://expresswifi.centipidtechnologies.com/users",
+          "path": "/users"
+        },
+        {
+          "text": "Tickets\n0",
+          "href": "https://expresswifi.centipidtechnologies.com/tickets",
+          "path": "/tickets"
+        },
+        {
+          "text": "Leads\n0",
+          "href": "https://expresswifi.centipidtechnologies.com/leads",
+          "path": "/leads"
+        },
+        {
+          "text": "Packages\n8",
+          "href": "https://expresswifi.centipidtechnologies.com/packages",
+          "path": "/packages"
+        },
+        {
+          "text": "Payments",
+          "href": "https://expresswifi.centipidtechnologies.com/payments",
+          "path": "/payments"
+        },
+        {
+          "text": "Vouchers\n1",
+          "href": "https://expresswifi.centipidtechnologies.com/vouchers",
+          "path": "/vouchers"
+        },
+        {
+          "text": "Expenses",
+          "href": "https://expresswifi.centipidtechnologies.com/expenses",
+          "path": "/expenses"
+        },
+        {
+          "text": "Messages",
+          "href": "https://expresswifi.centipidtechnologies.com/sms",
+          "path": "/sms"
+        },
+        {
+          "text": "Emails",
+          "href": "https://expresswifi.centipidtechnologies.com/emails",
+          "path": "/emails"
+        },
+        {
+          "text": "Campaigns\n0",
+          "href": "https://expresswifi.centipidtechnologies.com/campaigns",
+          "path": "/campaigns"
+        },
+        {
+          "text": "MikroTik\n3",
+          "href": "https://expresswifi.centipidtechnologies.com/nas",
+          "path": "/nas"
+        },
+        {
+          "text": "Equipment\n0",
+          "href": "https://expresswifi.centipidtechnologies.com/equipment",
+          "path": "/equipment"
+        },
+        {
+          "text": "Legal",
+          "href": "https://expresswifi.centipidtechnologies.com/legal",
+          "path": "/legal"
+        }
+      ],
+      "forms": [
+        {
+          "id": "",
+          "action": "https://expresswifi.centipidtechnologies.com/logout",
+          "method": "POST",
+          "fields": [
+            {
+              "type": "hidden",
+              "name": "_token",
+              "placeholder": "",
+              "label": "",
+              "required": false,
+              "disabled": false,
+              "options": []
+            }
+          ],
+          "submitButtons": [
+            "Sign out"
+          ]
+        }
+      ],
+      "tables": [],
+      "buttons": [
+        {
+          "text": "Collapse sidebar",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-icon-btn fi-size-md fi-topbar-close-collapse-sidebar-btn"
+        },
+        {
+          "text": "User menu",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-user-menu-trigger"
+        },
+        {
+          "text": "Sign out",
+          "type": "submit",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-dropdown-list-item"
+        },
+        {
+          "text": "Dashboard",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Users",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-group-btn"
+        },
+        {
+          "text": "Active Users\n0",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Users\n701",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Tickets\n0",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Leads\n0",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Finance",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-group-btn"
+        },
+        {
+          "text": "Packages\n8",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Payments",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Vouchers\n1",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Expenses",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Communication",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-group-btn"
+        },
+        {
+          "text": "Messages",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Emails",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Campaigns\n0",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Devices",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-group-btn"
+        },
+        {
+          "text": "MikroTik\n3",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Equipment\n0",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-sidebar-item-btn"
+        },
+        {
+          "text": "Expires in 2 days. Click to renew",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-color fi-color-danger fi-bg-color-600 hover:fi-bg-color-500 dark:fi-bg-color-600 dark:hover:fi-bg-color-500 fi-text-color-0 hover:fi-text-color-0 dark:fi-text-color-0 dark:hover:fi-text-color-0 fi-btn fi-size-md  fi-ac-btn-action"
+        },
+        {
+          "text": "Filters",
+          "type": "button",
+          "disabled": false,
+          "id": "",
+          "classes": "fi-btn fi-size-md  fi-ac-btn-action"
+        },
+        {
+          "text": "Running...",
+          "type": "submit",
+          "disabled": false,
+          "id": "",
+          "classes": ""
+        },
+        {
+          "text": "Reset",
+          "type": "submit",
+          "disabled": false,
+          "id": "",
+          "classes": ""
+        }
+      ],
+      "headings": [
+        {
+          "level": 1,
+          "text": "Good morning, Expresswifi 🌅",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Payments",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Active Users",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Customer retention rate (6 months)",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Data Usage",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Package Utilization",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Revenue Forecast (3 months)",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Sent SMS",
+          "id": ""
+        },
+        {
+          "level": 2,
+          "text": "Network Data Usage",
+          "id": ""
+        }
+      ],
+      "cards": [
+        {
+          "text": "EXPRESS PLOT WIFI\nGlobal search\nCTRL+F\nDashboard\nUsers\nActive Users\n0\nUsers\n701\nTickets\n0\nLeads\n0\nFinance\nPackages\n8\nPayments\nVouchers\n1\nExpenses\nCommunication\nMessages\nEmails\nCampaigns\n0\nDevices\nMikr",
+          "classes": "fi-body fi-panel-Tenant fi-body-has-navigation fi-body-has-sidebar-collapsible-on-desktop fi-body-has-topbar"
+        },
+        {
+          "text": "2FA Settings            \n\n                    \n\n        \n        \n\n                    \n                            \n\n    \n            \n    \n    \n    \n\n\n    \n    \n\n\n    \n    \n\n\n\n    \n            \n    ",
+          "classes": "fi-dropdown-panel "
+        },
+        {
+          "text": "Amount this month\nKsh 680.00\nTotal earned this month\nSMS balance\nKsh -0.40\nYour SMS balance\nTotal clients\n701\nNumber of clients",
+          "classes": "fi-wi-widget fi-grid-col lg:fi-grid-col-span fi-wi-stats-overview"
+        },
+        {
+          "text": "Amount this month\nKsh 680.00\nTotal earned this month",
+          "classes": "fi-wi-stats-overview-stat cursor-pointer"
+        },
+        {
+          "text": "Amount this month\nKsh 680.00\nTotal earned this month",
+          "classes": "fi-wi-stats-overview-stat-content"
+        },
+        {
+          "text": "Amount this month",
+          "classes": "fi-wi-stats-overview-stat-label-ctn"
+        },
+        {
+          "text": "Amount this month",
+          "classes": "fi-wi-stats-overview-stat-label"
+        },
+        {
+          "text": "Ksh 680.00",
+          "classes": "fi-wi-stats-overview-stat-value"
+        },
+        {
+          "text": "Total earned this month",
+          "classes": "fi-wi-stats-overview-stat-description fi-color fi-color-primary fi-text-color-700 dark:fi-text-color-400"
+        },
+        {
+          "text": "SMS balance\nKsh -0.40\nYour SMS balance",
+          "classes": "fi-wi-stats-overview-stat cursor-pointer"
+        },
+        {
+          "text": "SMS balance\nKsh -0.40\nYour SMS balance",
+          "classes": "fi-wi-stats-overview-stat-content"
+        },
+        {
+          "text": "SMS balance",
+          "classes": "fi-wi-stats-overview-stat-label-ctn"
+        },
+        {
+          "text": "SMS balance",
+          "classes": "fi-wi-stats-overview-stat-label"
+        },
+        {
+          "text": "Ksh -0.40",
+          "classes": "fi-wi-stats-overview-stat-value"
+        },
+        {
+          "text": "Your SMS balance",
+          "classes": "fi-wi-stats-overview-stat-description fi-color fi-color-primary fi-text-color-700 dark:fi-text-color-400"
+        }
+      ],
+      "lists": [
+        {
+          "type": "ul",
+          "items": [
+            "Dashboard",
+            "Dashboard",
+            "Users\nActive Users\n0\nUsers\n701\nTickets\n0\nLeads\n0",
+            "Active Users\n0",
+            "Users\n701",
+            "Tickets\n0",
+            "Leads\n0",
+            "Finance\nPackages\n8\nPayments\nVouchers\n1\nExpenses",
+            "Packages\n8",
+            "Payments"
+          ]
+        },
+        {
+          "type": "ul",
+          "items": [
+            "Dashboard"
+          ]
+        },
+        {
+          "type": "ul",
+          "items": [
+            "Active Users\n0",
+            "Users\n701",
+            "Tickets\n0",
+            "Leads\n0"
+          ]
+        },
+        {
+          "type": "ul",
+          "items": [
+            "Packages\n8",
+            "Payments",
+            "Vouchers\n1",
+            "Expenses"
+          ]
+        },
+        {
+          "type": "ul",
+          "items": [
+            "Messages",
+            "Emails",
+            "Campaigns\n0"
+          ]
+        },
+        {
+          "type": "ul",
+          "items": [
+            "MikroTik\n3",
+            "Equipment\n0"
+          ]
+        }
+      ],
+      "modals": [],
+      "tabs": [],
+      "breadcrumbs": [],
+      "footerText": "Centipid Shop\nWhatsapp Channel\nLegal\n© 2026 Centipid Billing. All Rights Reserved.",
+      "phase": "current-page-scrape"
+    }
+  ]
+}
