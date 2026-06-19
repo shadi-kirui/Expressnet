@@ -41,7 +41,7 @@ from .services import (
     normalize_phone,
     PaymentProviderError,
     ref,
-    require_secret,
+    _get_jwt_secret,
     router_interface_status,
     router_items,
     set_customer_enabled,
@@ -417,10 +417,14 @@ def auth_login(request):
     tenant = tenant_obj.as_dict(include_id=True)
     if tenant.get("status") != "active":
         return ok({"message": "Your account is pending admin activation. You will receive an email once it is active."}, 403)
+    try:
+        token = tenant_token(tenant["id"])
+    except Exception as exc:
+        return ok({"message": f"Server configuration error: {exc}"}, 500)
     return ok(
         {
             "success": True,
-            "token": tenant_token(tenant["id"]),
+            "token": token,
             "tenant": {"id": tenant["id"], "business_name": tenant.get("business_name"), "email": tenant.get("email"), **tenant_theme_payload(tenant)},
         }
     )
@@ -845,7 +849,7 @@ def router_provision_command(request):
         "api_password": api_password,
         "exp": expires_at,
     }
-    token = jwt.encode(payload, require_secret("JWT_SECRET"), algorithm="HS256")
+    token = jwt.encode(payload, _get_jwt_secret("JWT_SECRET"), algorithm="HS256")
     ref(f"tenants/{request.tenant['id']}").update({"provision_token_expires_at": expires_at.isoformat()})
     script_url = f"{public_base_url(request)}/api/router/provision/{token}"
     command = f'/tool fetch mode=https url="{script_url}" dst-path=billing-saas.rsc; delay 2s; /import billing-saas.rsc;'
@@ -856,7 +860,7 @@ def router_provision_command(request):
 @api_view(["GET"])
 def router_provision_script(request, token):
     try:
-        payload = jwt.decode(token, require_secret("JWT_SECRET"), algorithms=["HS256"])
+        payload = jwt.decode(token, _get_jwt_secret("JWT_SECRET"), algorithms=["HS256"])
     except Exception:
         return HttpResponse("# Invalid or expired provisioning token\n", status=401, content_type="text/plain")
     if payload.get("purpose") != "mikrotik_provision":
@@ -1585,7 +1589,11 @@ def admin_login(request):
         login_count = int(admin.get("login_count") or 0) + 1
         ref(f"admins/{admin['id']}").update({"last_login": iso_now(), "login_count": login_count})
         write_audit_log(admin["id"], admin.get("email"), "LOGIN", admin["id"], "admin", request, {"login_count": login_count})
-        return ok({"token": admin_token(admin["id"], admin), "admin": {"id": admin["id"], "name": admin.get("name"), "email": admin.get("email"), "role": admin.get("role")}})
+        try:
+            token = admin_token(admin["id"], admin)
+        except Exception as exc:
+            return ok({"error": f"Server configuration error: {exc}"}, 500)
+        return ok({"token": token, "admin": {"id": admin["id"], "name": admin.get("name"), "email": admin.get("email"), "role": admin.get("role")}})
 
     user = User.objects.filter(email__iexact=email).first()
     if not user or not user.is_active or not user.check_password(password):
@@ -1608,7 +1616,11 @@ def admin_login(request):
     admin = admin_profile.as_dict()
     admin["id"] = str(admin_profile.pk)
     write_audit_log(admin["id"], admin.get("email"), "LOGIN", admin["id"], "admin", request, {"login_count": admin_profile.login_count})
-    return ok({"token": admin_token(admin["id"], admin), "admin": {"id": admin["id"], "name": admin.get("name"), "email": admin.get("email"), "role": admin.get("role")}})
+    try:
+        token = admin_token(admin["id"], admin)
+    except Exception as exc:
+        return ok({"error": f"Server configuration error: {exc}"}, 500)
+    return ok({"token": token, "admin": {"id": admin["id"], "name": admin.get("name"), "email": admin.get("email"), "role": admin.get("role")}})
 
 
 def mask_tenant(tenant):

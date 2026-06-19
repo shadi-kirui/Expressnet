@@ -38,8 +38,8 @@ def require_secret(name):
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"{name} is required")
-    if len(value) < 32:
-        raise RuntimeError(f"{name} must be at least 32 characters")
+    if len(value) < 16:
+        raise RuntimeError(f"{name} must be at least 16 characters")
     return value
 
 
@@ -294,13 +294,23 @@ def hash_password(password):
 def check_password(password, hashed):
     if not hashed:
         return False
-    return bcrypt.checkpw(str(password).encode(), str(hashed).encode())
+    try:
+        return bcrypt.checkpw(str(password).encode(), str(hashed).encode())
+    except (ValueError, TypeError):
+        return False
+
+
+def _get_jwt_secret(name):
+    value = os.getenv(name, "")
+    if not value:
+        raise RuntimeError(f"{name} is not configured. Please set it in your .env file.")
+    return value
 
 
 def tenant_token(tenant_id):
     return jwt.encode(
         {"id": tenant_id, "exp": utcnow() + timedelta(days=7)},
-        require_secret("JWT_SECRET"),
+        _get_jwt_secret("JWT_SECRET"),
         algorithm="HS256",
     )
 
@@ -314,17 +324,17 @@ def admin_token(admin_id, admin_data):
             "role": "admin",
             "exp": utcnow() + timedelta(hours=4),
         },
-        require_secret("ADMIN_JWT_SECRET"),
+        _get_jwt_secret("ADMIN_JWT_SECRET"),
         algorithm="HS256",
     )
 
 
 def decode_tenant_token(token):
-    return jwt.decode(token, require_secret("JWT_SECRET"), algorithms=["HS256"])
+    return jwt.decode(token, _get_jwt_secret("JWT_SECRET"), algorithms=["HS256"])
 
 
 def decode_admin_token(token):
-    return jwt.decode(token, require_secret("ADMIN_JWT_SECRET"), algorithms=["HS256"])
+    return jwt.decode(token, _get_jwt_secret("ADMIN_JWT_SECRET"), algorithms=["HS256"])
 
 
 def normalize_phone(phone):
