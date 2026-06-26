@@ -5,6 +5,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import bcrypt
 import firebase_admin
@@ -566,6 +567,13 @@ def router_add_item(tenant, path, fields):
         api.close()
 
 
+def find_router_item_by_fields(api, path, fields):
+    for item in api.path(*path).select():
+        if all(str(item.get(key) or "") == str(value or "") for key, value in fields.items()):
+            return item
+    return None
+
+
 def find_router_item(api, path, name):
     for item in api.path(*path).select():
         if item.get("name") == name:
@@ -598,6 +606,97 @@ def create_ppp_profile(tenant, name, speed):
 
 def create_hotspot_profile(tenant, name, speed):
     return upsert_router_profile(tenant, ("ip", "hotspot", "user", "profile"), name, speed)
+
+
+def captive_portal_url(tenant):
+    base = get_public_base_url().rstrip("/")
+    return f"{base}/portal/{tenant.get('id')}"
+
+
+def captive_portal_host(tenant):
+    return urlparse(captive_portal_url(tenant)).netloc.split("@")[-1].split(":")[0]
+
+
+def upsert_router_item(api, path, match_fields, fields):
+    router_path = api.path(*path)
+    existing = find_router_item_by_fields(api, path, match_fields)
+    if existing and existing.get(".id"):
+        router_path.update(**{".id": existing[".id"], **fields})
+        return existing[".id"]
+    return router_path.add(**fields)
+
+
+def hotspot_login_redirect_html(portal_url):
+    return (
+        "<!doctype html><html><head>"
+        f"<meta http-equiv='refresh' content='0; url={portal_url}'>"
+        "</head><body>"
+        f"<script>location.replace('{portal_url}');</script>"
+        "</body></html>"
+    )
+
+
+def ensure_hotspot_login_redirect(api, portal_url):
+    contents = hotspot_login_redirect_html(portal_url)
+    files = list(api.path("file").select())
+    for name in ["hotspot/login.html", "flash/hotspot/login.html"]:
+        existing = next((item for item in files if item.get("name") == name), None)
+        if existing and existing.get(".id"):
+            api.path("file").update(**{".id": existing[".id"], "contents": contents})
+            return name
+    api.path("file").add(**{"name": "hotspot/login.html", "contents": contents})
+    return "hotspot/login.html"
+
+
+def ensure_hotspot_captive_portal(tenant):
+    if not has_mikrotik_credentials(tenant):
+        return None
+
+    portal_url = captive_portal_url(tenant)
+    portal_host = captive_portal_host(tenant)
+    profile_name = "billing-saas-captive"
+    api = router_connect(tenant)
+    try:
+        upsert_router_item(
+            api,
+            ("ip", "hotspot", "profile"),
+            {"name": profile_name},
+            {
+                "name": profile_name,
+                "login-by": "http-chap,http-pap",
+                "use-radius": "no",
+                "html-directory": "hotspot",
+                "comment": f"billing-saas captive portal: {portal_url}",
+            },
+        )
+        for host in [
+            portal_host,
+            "checkout.paystack.com",
+            "api.paystack.co",
+            "*.paystack.co",
+            "*.paystack.com",
+        ]:
+            if not host:
+                continue
+            upsert_router_item(
+                api,
+                ("ip", "hotspot", "walled-garden"),
+                {"dst-host": host, "comment": "billing-saas captive portal access"},
+                {
+                    "action": "allow",
+                    "dst-host": host,
+                    "comment": "billing-saas captive portal access",
+                    "disabled": "no",
+                },
+            )
+        login_page = None
+        try:
+            login_page = ensure_hotspot_login_redirect(api, portal_url)
+        except Exception:
+            login_page = None
+        return {"profile": profile_name, "portal_url": portal_url, "portal_host": portal_host, "login_page": login_page}
+    finally:
+        api.close()
 
 
 def router_interface_status(tenant):
@@ -669,14 +768,13 @@ def configure_router_port(tenant, interface_name, service_type, profile_name="de
     if not interface or not interface.get(".id"):
         raise ValueError("Router interface not found")
 
-    router_update_item(
-        tenant,
-        ("interface",),
-        interface[".id"],
-        {"comment": f"billing-saas:{service_type}:profile={profile_name or 'default'}"},
-    )
-
     if service_type == "pppoe":
+        router_update_item(
+            tenant,
+            ("interface",),
+            interface[".id"],
+            {"comment": f"billing-saas:{service_type}:profile={profile_name or 'default'}"},
+        )
         servers = router_items(tenant, "interface", "pppoe-server", "server")
         existing = next((item for item in servers if item.get("interface") == interface_name), None)
         fields = {
@@ -692,19 +790,28 @@ def configure_router_port(tenant, interface_name, service_type, profile_name="de
         router_add_item(tenant, ("interface", "pppoe-server", "server"), fields)
         return {"created": True, "service_type": service_type, "interface": interface_name}
 
+    captive = ensure_hotspot_captive_portal(tenant) or {}
+    hotspot_profile = captive.get("profile") or "billing-saas-captive"
+    router_update_item(
+        tenant,
+        ("interface",),
+        interface[".id"],
+        {"comment": f"billing-saas:hotspot:portal={captive.get('portal_url') or ''}".strip()},
+    )
     servers = router_items(tenant, "ip", "hotspot")
     existing = next((item for item in servers if item.get("interface") == interface_name), None)
     fields = {
         "name": f"billing-hotspot-{interface_name}",
         "interface": interface_name,
-        "profile": profile_name or "default",
+        "profile": hotspot_profile,
         "disabled": "no",
+        "comment": f"billing-saas captive portal: {captive.get('portal_url') or ''}".strip(),
     }
     if existing and existing.get(".id"):
         router_update_item(tenant, ("ip", "hotspot"), existing[".id"], fields)
-        return {"updated": True, "service_type": service_type, "interface": interface_name}
+        return {"updated": True, "service_type": service_type, "interface": interface_name, "profile": hotspot_profile, "portal_url": captive.get("portal_url")}
     router_add_item(tenant, ("ip", "hotspot"), fields)
-    return {"created": True, "service_type": service_type, "interface": interface_name}
+    return {"created": True, "service_type": service_type, "interface": interface_name, "profile": hotspot_profile, "portal_url": captive.get("portal_url")}
 
 
 def upsert_customer_access(tenant, customer, disabled=False):
@@ -713,6 +820,23 @@ def upsert_customer_access(tenant, customer, disabled=False):
     service_type = customer.get("service_type") or "pppoe"
     api = router_connect(tenant)
     try:
+        if service_type == "tv":
+            mac_address = str(customer.get("mac_address") or customer.get("username") or "").strip().upper()
+            if not mac_address:
+                return None
+            path = ("ip", "hotspot", "ip-binding")
+            router_path = api.path(*path)
+            existing = find_router_item_by_fields(api, path, {"mac-address": mac_address})
+            fields = {
+                "mac-address": mac_address,
+                "type": "bypassed",
+                "comment": f"billing-saas tv access: {customer.get('package_name') or customer.get('package') or ''}".strip(),
+                "disabled": "yes" if disabled else "no",
+            }
+            if existing and existing.get(".id"):
+                router_path.update(**{".id": existing[".id"], **fields})
+                return existing[".id"]
+            return router_path.add(**fields)
         path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
         router_path = api.path(*path)
         existing = find_router_item(api, path, customer.get("username"))
@@ -737,6 +861,12 @@ def set_customer_enabled(tenant, username, service_type="hotspot", enabled=True)
         return None
     api = router_connect(tenant)
     try:
+        if service_type == "tv":
+            path = ("ip", "hotspot", "ip-binding")
+            existing = find_router_item_by_fields(api, path, {"mac-address": str(username or "").strip().upper()})
+            if not existing or not existing.get(".id"):
+                return None
+            return api.path(*path).update(**{".id": existing[".id"], "disabled": "no" if enabled else "yes"})
         path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
         existing = find_router_item(api, path, username)
         if not existing or not existing.get(".id"):
@@ -751,6 +881,12 @@ def delete_router_customer(tenant, username, service_type="pppoe"):
         return None
     api = router_connect(tenant)
     try:
+        if service_type == "tv":
+            path = ("ip", "hotspot", "ip-binding")
+            existing = find_router_item_by_fields(api, path, {"mac-address": str(username or "").strip().upper()})
+            if not existing or not existing.get(".id"):
+                return None
+            return api.path(*path).remove(existing[".id"])
         path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
         existing = find_router_item(api, path, username)
         if not existing or not existing.get(".id"):

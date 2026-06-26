@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+from urllib.parse import urlparse
 
 import jwt
 from django.conf import settings
@@ -31,6 +32,8 @@ from .services import (
     configure_router_port,
     create_paystack_subaccount,
     delete_router_customer,
+    captive_portal_url,
+    ensure_hotspot_captive_portal,
     find_child_by_field,
     has_mikrotik_credentials,
     hash_password,
@@ -179,6 +182,42 @@ def parse_date(value):
 
 def payment_date(payment):
     return parse_date(payment.get("paid_at") or payment.get("initiated_at") or payment.get("created_at"))
+
+
+def package_duration_delta(package):
+    unit = str((package or {}).get("duration_unit") or "").strip().lower()
+    hours = (package or {}).get("duration_hours")
+    if hours not in {None, ""}:
+        try:
+            return timedelta(hours=float(hours))
+        except (TypeError, ValueError):
+            pass
+    if unit in {"hour", "hours"}:
+        try:
+            return timedelta(hours=float((package or {}).get("duration_value") or (package or {}).get("duration_days") or 1))
+        except (TypeError, ValueError):
+            return timedelta(hours=1)
+    try:
+        return timedelta(days=int((package or {}).get("duration_days") or 1))
+    except (TypeError, ValueError):
+        return timedelta(days=1)
+
+
+def package_duration_label(package):
+    delta = package_duration_delta(package)
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 86400:
+        hours = max(1, round(total_seconds / 3600))
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    days = max(1, round(total_seconds / 86400))
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def normalize_mac(value):
+    raw = "".join(ch for ch in str(value or "").upper() if ch in "0123456789ABCDEF")
+    if len(raw) != 12:
+        return ""
+    return ":".join(raw[index : index + 2] for index in range(0, 12, 2))
 
 
 def format_money(value):
@@ -473,7 +512,10 @@ def public_packages(request, tenant_id):
     if tenant.get("status") == "suspended":
         return ok({"message": "Tenant is not accepting payments"}, 403)
     packages = [
-        {key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "price"]}
+        {
+            **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price"]},
+            "duration_label": package_duration_label(pkg),
+        }
         for pkg in list_children(f"tenants/{tenant_id}/packages")
         if pkg.get("is_active") is not False
     ]
@@ -496,10 +538,34 @@ def public_pay(request, tenant_id):
         return ok({"message": "Package not found"}, 404)
     tenant = {"id": tenant_id, **tenant_data}
     phone = normalize_phone(data["phone"])
+    service_type = str(data.get("service_type") or "hotspot").strip().lower()
+    if service_type not in {"hotspot", "pppoe", "tv"}:
+        return ok({"message": "Invalid service type"}, 400)
+    customer = None
+    mac_address = ""
+    if service_type == "pppoe":
+        username = str(data.get("username") or "").strip()
+        if not username:
+            return ok({"message": "PPPoE username is required"}, 400)
+        customer = next(
+            (
+                item
+                for item in list_children(f"tenants/{tenant_id}/customers")
+                if str(item.get("username") or "").lower() == username.lower()
+            ),
+            None,
+        )
+        if not customer:
+            return ok({"message": "PPPoE account not found. Please contact your ISP."}, 404)
+        phone = normalize_phone(data.get("phone") or customer.get("phone"))
+    elif service_type == "tv":
+        mac_address = normalize_mac(data.get("mac_address"))
+        if not mac_address:
+            return ok({"message": "Enter a valid TV MAC address"}, 400)
     payment_ref = ref(f"tenants/{tenant_id}/payments").push(
         {
-            "customer_id": None,
-            "customer_name": None,
+            "customer_id": customer.get("id") if customer else None,
+            "customer_name": customer.get("name") if customer else None,
             "package_id": data["package_id"],
             "package_name": pkg.get("name"),
             "amount": float(pkg.get("price") or 0),
@@ -508,7 +574,9 @@ def public_pay(request, tenant_id):
             "status": "pending",
             "paid_at": None,
             "initiated_at": iso_now(),
-            "service_type": "hotspot",
+            "service_type": service_type,
+            "username": customer.get("username") if customer else None,
+            "mac_address": mac_address,
             "source": "customer_portal",
             "provider": "paystack",
         }
@@ -521,7 +589,13 @@ def public_pay(request, tenant_id):
             email=data.get("email"),
             phone=phone,
             description=f"{pkg.get('name')} internet package",
-            metadata={"package_id": data["package_id"], "package_name": pkg.get("name"), "service_type": "hotspot"},
+            metadata={
+                "package_id": data["package_id"],
+                "package_name": pkg.get("name"),
+                "service_type": service_type,
+                "username": customer.get("username") if customer else None,
+                "mac_address": mac_address,
+            },
         )
     except PaymentProviderError as exc:
         payment_ref.update({"status": "failed", "failed_at": iso_now(), "callback_result_desc": exc.detail})
@@ -562,9 +636,11 @@ def public_redeem(request, tenant_id):
         {
             "success": True,
             "package_name": payment.get("package_name"),
+            "service_type": payment.get("service_type"),
             "phone": payment.get("phone"),
             "username": payment.get("access_username"),
             "password": payment.get("access_password"),
+            "mac_address": payment.get("access_mac_address") or payment.get("mac_address"),
             "expires_at": payment.get("access_expires_at"),
         }
     )
@@ -595,9 +671,11 @@ def public_verify(request, tenant_id):
             "success": payment.get("status") == "success",
             "status": payment.get("status"),
             "package_name": payment.get("package_name"),
+            "service_type": payment.get("service_type"),
             "phone": payment.get("phone"),
             "username": payment.get("access_username"),
             "password": payment.get("access_password"),
+            "mac_address": payment.get("access_mac_address") or payment.get("mac_address"),
             "expires_at": payment.get("access_expires_at"),
             "paymentId": payment_id,
         }
@@ -651,6 +729,9 @@ def customer_add(request):
         return ok({"message": "Name, phone, username, password, and package are required"}, 400)
     if any(str(c.get("username", "")).lower() == str(data["username"]).lower() for c in list_children(f"tenants/{request.tenant['id']}/customers")):
         return ok({"message": "A customer with this username already exists"}, 409)
+    service_type = str(data.get("service_type") or "pppoe").strip().lower()
+    if service_type not in {"pppoe", "hotspot"}:
+        return ok({"message": "Customer service type must be PPPoE or Hotspot"}, 400)
     provision = data.get("provision_mikrotik", True)
     if provision:
         if not has_mikrotik_credentials(request.tenant):
@@ -658,8 +739,11 @@ def customer_add(request):
         pkg = find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", data["package_name"])
         if not pkg:
             return ok({"message": f"Package \"{data['package_name']}\" was not found"}, 404)
-        create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
-        upsert_customer_access(request.tenant, {**data, "service_type": "pppoe"}, disabled=True)
+        if service_type == "pppoe":
+            create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
+        else:
+            create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
+        upsert_customer_access(request.tenant, {**data, "service_type": service_type}, disabled=True)
     new_ref = ref(f"tenants/{request.tenant['id']}/customers").push(
         {
             "name": data["name"],
@@ -667,9 +751,9 @@ def customer_add(request):
             "username": data["username"],
             "password": data["password"],
             "package": data["package_name"],
-            "service_type": "pppoe",
+            "service_type": service_type,
             "provisioning_status": "provisioned" if provision else "not_requested",
-            "provisioning_message": "Home fiber PPPoE secret created on MikroTik and kept disabled until payment" if provision else None,
+            "provisioning_message": f"{service_type.upper()} access created on MikroTik and kept disabled until payment" if provision else None,
             "status": "inactive",
             "expiry_date": None,
             "auto_reconnect": True,
@@ -688,12 +772,16 @@ def customer_provision(request, customer_id):
         return ok({"message": "Customer not found"}, 404)
     if not has_mikrotik_credentials(request.tenant):
         return ok({"message": "Configure MikroTik credentials before provisioning customers"}, 400)
+    service_type = customer.get("service_type") or "pppoe"
     pkg = find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", customer.get("package"))
     if pkg:
-        create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
-    upsert_customer_access(request.tenant, {**customer, "package_name": customer.get("package"), "service_type": "pppoe"}, disabled=customer.get("status") != "active")
+        if service_type == "pppoe":
+            create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
+        elif service_type == "hotspot":
+            create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
+    upsert_customer_access(request.tenant, {**customer, "package_name": customer.get("package"), "service_type": service_type}, disabled=customer.get("status") != "active")
     ref(f"tenants/{request.tenant['id']}/customers/{customer_id}").update(
-        {"provisioning_status": "provisioned", "service_type": "pppoe", "auto_reconnect": True, "provisioning_message": "Home fiber PPPoE secret synced on MikroTik", "provisioned_at": iso_now()}
+        {"provisioning_status": "provisioned", "service_type": service_type, "auto_reconnect": True, "provisioning_message": f"{service_type.upper()} access synced on MikroTik", "provisioned_at": iso_now()}
     )
     return ok({"success": True, "message": "Customer provisioned on MikroTik"})
 
@@ -702,16 +790,17 @@ def customer_provision(request, customer_id):
 @api_view(["GET"])
 @tenant_required
 def customer_hotspot_portal(request):
-    base = os.getenv("PUBLIC_APP_URL") or f"{request.scheme}://{request.get_host()}"
-    base = base.rstrip("/")
     tenant_id = request.tenant["id"]
+    tenant = {"id": tenant_id, **request.tenant}
+    portal_url = captive_portal_url(tenant)
     return ok(
         {
             "tenant_id": tenant_id,
-            "portal_url": f"{base}/customers/{tenant_id}",
-            "fallback_portal_url": f"{base}/portal/{tenant_id}",
-            "hotspot_url": f"{base}/hotspot/{tenant_id}",
-            "description": "Use the customers portal URL as the MikroTik hotspot redirect/login target so customers can select a package and pay for internet access.",
+            "portal_url": portal_url,
+            "fallback_portal_url": portal_url,
+            "hotspot_url": portal_url,
+            "hotspot_profile": "billing-saas-captive",
+            "description": "Assign the customer-facing router port as Hotspot. The billing-saas-captive profile redirects unpaid users to this portal so they can select a package and pay before access is activated.",
         }
     )
 
@@ -725,11 +814,17 @@ def packages(request, package_id=None):
         return as_collection_response(request, list_children(f"tenants/{tenant_id}/packages"))
     if method(request, "PATCH") and package_id:
         data = body(request)
-        updates = {key: data[key] for key in ["name", "speed", "duration_days", "price", "is_active"] if key in data}
+        updates = {key: data[key] for key in ["name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "is_active"] if key in data}
         if not updates:
             return ok({"message": "No package fields provided"}, 400)
+        if "duration_unit" in updates:
+            updates["duration_unit"] = "hours" if str(updates["duration_unit"]).lower().startswith("hour") else "days"
+        if "duration_value" in updates:
+            updates["duration_value"] = float(updates["duration_value"])
         if "duration_days" in updates:
             updates["duration_days"] = int(updates["duration_days"])
+        if "duration_hours" in updates:
+            updates["duration_hours"] = float(updates["duration_hours"])
         if "price" in updates:
             updates["price"] = float(updates["price"])
         if "is_active" in updates:
@@ -760,8 +855,12 @@ def packages(request, package_id=None):
 @tenant_required
 def package_add(request):
     data = body(request)
-    if any(not data.get(field) for field in ["name", "speed", "duration_days", "price"]):
+    if any(not data.get(field) for field in ["name", "speed", "price"]):
         return ok({"message": "All package fields are required"}, 400)
+    duration_unit = "hours" if str(data.get("duration_unit") or "").lower().startswith("hour") else "days"
+    duration_value = float(data.get("duration_value") or data.get("duration_hours") or data.get("duration_days") or 1)
+    duration_days = 1 if duration_unit == "hours" else int(duration_value)
+    duration_hours = duration_value if duration_unit == "hours" else duration_value * 24
     if find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", data["name"]):
         return ok({"message": "A package with this name already exists"}, 409)
     router_synced = False
@@ -777,7 +876,10 @@ def package_add(request):
         {
             "name": data["name"],
             "speed": data["speed"],
-            "duration_days": int(data["duration_days"]),
+            "duration_days": duration_days,
+            "duration_unit": duration_unit,
+            "duration_value": duration_value,
+            "duration_hours": duration_hours,
             "price": float(data["price"]),
             "is_active": data.get("is_active") is not False,
             "ppp_profile_status": "synced" if router_synced else "pending",
@@ -829,7 +931,12 @@ def router_ports(request):
     try:
         result = configure_router_port(request.tenant, interface_name, service_type, profile_name)
         assignments = dict(request.tenant.get("router_port_assignments") or {})
-        assignments[interface_name] = {"service_type": service_type, "profile": profile_name, "updated_at": iso_now()}
+        assignments[interface_name] = {
+            "service_type": service_type,
+            "profile": result.get("profile") or profile_name,
+            "portal_url": result.get("portal_url"),
+            "updated_at": iso_now(),
+        }
         ref(f"tenants/{request.tenant['id']}").update({"router_port_assignments": assignments})
         return ok({"success": True, "message": f"{interface_name} assigned to {service_type.upper()}", "result": result, "assignments": assignments})
     except Exception as exc:
@@ -865,6 +972,11 @@ def router_provision_script(request, token):
         return HttpResponse("# Invalid or expired provisioning token\n", status=401, content_type="text/plain")
     if payload.get("purpose") != "mikrotik_provision":
         return HttpResponse("# Invalid provisioning token\n", status=401, content_type="text/plain")
+    tenant_id = str(payload.get("tenant_id") or "")
+    base_url = public_base_url(request).rstrip("/")
+    portal_url = f"{base_url}/portal/{tenant_id}"
+    portal_host = urlparse(base_url).netloc.split("@")[-1].split(":")[0]
+    login_html = f"<!doctype html><html><head><meta http-equiv='refresh' content='0; url={portal_url}'></head><body><script>location.replace('{portal_url}');</script></body></html>"
     api_user = str(payload.get("api_user") or "billing-api").replace('"', "")
     api_password = str(payload.get("api_password") or "").replace('"', "")
     script = f""":log info "Billing SaaS provisioning started";
@@ -872,6 +984,15 @@ def router_provision_script(request, token):
 :do {{ /user remove [find name="{api_user}"] }} on-error={{}}
 /user add name="{api_user}" password="{api_password}" group=billing-saas comment="Billing SaaS API user";
 /ip service enable api;
+:do {{ /ip hotspot profile add name=billing-saas-captive login-by=http-chap,http-pap use-radius=no html-directory=hotspot comment="Billing SaaS captive portal: {portal_url}" }} on-error={{ /ip hotspot profile set [find name=billing-saas-captive] login-by=http-chap,http-pap use-radius=no html-directory=hotspot comment="Billing SaaS captive portal: {portal_url}" }}
+:do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{}}
+:do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
+:do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
+:do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
+:do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
+:local billingLogin "{login_html}";
+:do {{ /file set [find name="hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="hotspot/login.html" contents=$billingLogin }} on-error={{}} }}
+:do {{ /file set [find name="flash/hotspot/login.html"] contents=$billingLogin }} on-error={{}}
 :log info "Billing SaaS provisioning complete";
 """
     return HttpResponse(script, content_type="text/plain")
@@ -1416,7 +1537,8 @@ def settings_mikrotik_test(request):
     if not candidate.get("mikrotik_pass"):
         return ok({"message": "MikroTik password is required to test the connection"}, 400)
     profiles = router_items(candidate, "ppp", "profile")
-    return ok({"success": True, "message": "MikroTik connection successful", "profile_count": len(profiles)})
+    captive = ensure_hotspot_captive_portal(candidate)
+    return ok({"success": True, "message": "MikroTik connection successful. Captive portal profile is ready.", "profile_count": len(profiles), "hotspot_profile": (captive or {}).get("profile"), "portal_url": (captive or {}).get("portal_url")})
 
 
 @csrf_exempt
@@ -1455,25 +1577,38 @@ def to_access_username(phone):
 def activate_paid_access(tenant, payment_id, payment, phone, payment_code):
     tenant_id = tenant["id"]
     package_name = payment.get("package_name")
-    customer = next((c for c in list_children(f"tenants/{tenant_id}/customers") if str(c.get("phone")) == str(phone)), None)
+    customers_data = list_children(f"tenants/{tenant_id}/customers")
+    customer = None
+    if payment.get("customer_id"):
+        customer = next((c for c in customers_data if str(c.get("id")) == str(payment.get("customer_id"))), None)
+    if not customer and payment.get("username"):
+        customer = next((c for c in customers_data if str(c.get("username") or "").lower() == str(payment.get("username") or "").lower()), None)
+    if not customer and phone:
+        customer = next((c for c in customers_data if str(c.get("phone")) == str(phone)), None)
     service_type = payment.get("service_type") or (customer or {}).get("service_type") or "hotspot"
     package_for_access = package_name or (customer or {}).get("package")
     pkg = find_child_by_field(f"tenants/{tenant_id}/packages", "name", package_for_access)
-    expiry = utcnow() + timedelta(days=int((pkg or {}).get("duration_days") or 1))
-    username = (customer or {}).get("username") or to_access_username(phone)
+    expiry = utcnow() + package_duration_delta(pkg)
+    mac_address = normalize_mac(payment.get("mac_address") or (customer or {}).get("mac_address"))
+    username = mac_address if service_type == "tv" else (payment.get("username") or (customer or {}).get("username") or to_access_username(phone))
     password = str(payment_code)
     if customer:
-        ref(f"tenants/{tenant_id}/customers/{customer['id']}").update({"username": username, "password": password, "package": package_for_access, "service_type": service_type, "status": "active", "expiry_date": expiry.isoformat(), "last_payment_id": payment_id, "last_payment_code": payment_code, "auto_reconnect": True, "updated_at": iso_now()})
+        updates = {"username": username, "password": password, "package": package_for_access, "service_type": service_type, "status": "active", "expiry_date": expiry.isoformat(), "last_payment_id": payment_id, "last_payment_code": payment_code, "auto_reconnect": True, "updated_at": iso_now()}
+        if mac_address:
+            updates["mac_address"] = mac_address
+        ref(f"tenants/{tenant_id}/customers/{customer['id']}").update(updates)
         customer_id = customer["id"]
     else:
-        new_ref = ref(f"tenants/{tenant_id}/customers").push({"name": phone, "phone": phone, "username": username, "password": password, "package": package_for_access, "service_type": service_type, "status": "active", "expiry_date": expiry.isoformat(), "last_payment_id": payment_id, "last_payment_code": payment_code, "auto_reconnect": True, "created_at": iso_now()})
+        new_ref = ref(f"tenants/{tenant_id}/customers").push({"name": mac_address or phone, "phone": phone, "username": username, "password": password, "package": package_for_access, "service_type": service_type, "status": "active", "expiry_date": expiry.isoformat(), "last_payment_id": payment_id, "last_payment_code": payment_code, "auto_reconnect": True, "mac_address": mac_address, "created_at": iso_now()})
         customer_id = new_ref.key
     if service_type == "hotspot" and pkg:
         create_hotspot_profile(tenant, pkg["name"], pkg.get("speed"))
-    upsert_customer_access(tenant, {"username": username, "password": password, "package_name": package_for_access, "service_type": service_type})
+    if service_type == "tv" and not mac_address:
+        raise ValueError("TV MAC address is required for activation")
+    upsert_customer_access(tenant, {"username": username, "password": password, "package_name": package_for_access, "service_type": service_type, "mac_address": mac_address})
     set_customer_enabled(tenant, username, service_type, True)
-    ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"customer_id": customer_id, "access_username": username, "access_password": password, "access_expires_at": expiry.isoformat(), "access_status": "active", "auto_reconnect": True})
-    return {"username": username, "password": password, "expiry_date": expiry.isoformat()}
+    ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"customer_id": customer_id, "access_username": username, "access_password": password, "access_mac_address": mac_address, "access_expires_at": expiry.isoformat(), "access_status": "active", "auto_reconnect": True})
+    return {"username": username, "password": password, "mac_address": mac_address, "expiry_date": expiry.isoformat()}
 
 
 def find_payment_by_paystack_reference(reference, tenant_id=None, payment_id=None):

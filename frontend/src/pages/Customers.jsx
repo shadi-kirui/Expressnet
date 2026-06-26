@@ -11,6 +11,7 @@ const initialForm = {
   username: '',
   password: '',
   package_name: '',
+  service_type: 'pppoe',
   provision_mikrotik: true,
 };
 
@@ -26,7 +27,7 @@ function formatDate(value) {
   return date && !Number.isNaN(date.valueOf()) ? date.toLocaleDateString() : '-';
 }
 
-export default function Customers() {
+export default function Customers({ initialFilter = 'all', serviceLocked = null, title = 'Users' }) {
   const [customers, setCustomers] = useState([]);
   const [packages, setPackages] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -35,7 +36,7 @@ export default function Customers() {
   const [provisioningId, setProvisioningId] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState(initialFilter);
   const [search, setSearch] = useState('');
   const [form, setForm] = useState(initialForm);
   const [errors, setErrors] = useState({});
@@ -70,6 +71,7 @@ export default function Customers() {
       const isActive = customer.status === 'active';
       if (statusFilter === 'active' && !isActive) return false;
       if (statusFilter === 'inactive' && isActive) return false;
+      if (serviceLocked && (customer.service_type || 'pppoe') !== serviceLocked) return false;
       if (statusFilter === 'hotspot' && (customer.service_type || 'pppoe') !== 'hotspot') return false;
       if (statusFilter === 'pppoe' && (customer.service_type || 'pppoe') !== 'pppoe') return false;
       if (statusFilter === 'paused' && !['paused', 'suspended', 'inactive'].includes(String(customer.status || '').toLowerCase())) return false;
@@ -77,7 +79,7 @@ export default function Customers() {
       const haystack = `${customer.name || ''} ${customer.phone || ''} ${customer.username || ''} ${customer.package || ''}`.toLowerCase();
       return haystack.includes(search.toLowerCase());
     });
-  }, [customers, search, statusFilter]);
+  }, [customers, search, serviceLocked, statusFilter]);
 
   const userFilterTabs = useMemo(() => ([
     ['all', 'All', userStats.total, Users],
@@ -147,7 +149,7 @@ export default function Customers() {
         });
         toast.success('Customer updated');
       } else {
-        await api.post('/customers/add', form);
+        await api.post('/customers/add', { ...form, service_type: form.service_type || serviceLocked || 'pppoe' });
         toast.success('Customer added');
       }
       closeModal();
@@ -265,15 +267,15 @@ export default function Customers() {
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="page-title">Users</h1>
-          <p className="page-subtitle">Manage PPPoE and Hotspot users from one page, with active and inactive filters.</p>
+          <h1 className="page-title">{title}</h1>
+          <p className="page-subtitle">{serviceLocked === 'pppoe' ? 'Manage PPPoE subscribers, renewals, expiry, and MikroTik provisioning.' : 'Manage PPPoE and Hotspot users from one page, with active and inactive filters.'}</p>
         </div>
         <div className="flex gap-2">
           <button type="button" className="btn-secondary" onClick={exportCsv}>
             <Download size={15} />
             Export CSV
           </button>
-          <button type="button" className="btn-primary" onClick={() => { setEditingId(null); setModalOpen(true); }}>
+          <button type="button" className="btn-primary" onClick={() => { setEditingId(null); setForm({ ...initialForm, service_type: serviceLocked || 'pppoe' }); setModalOpen(true); }}>
             <Plus size={15} />
             Add User
           </button>
@@ -402,6 +404,15 @@ export default function Customers() {
                 <input id="password" name="password" type="password" className="form-input" value={form.password} onChange={update} />
                 {errors.password && <p className="form-error">{errors.password}</p>}
               </div>}
+              {!serviceLocked && (
+                <div className="sm:col-span-2">
+                  <label className="form-label" htmlFor="service_type">Service type</label>
+                  <select id="service_type" name="service_type" className="form-input" value={form.service_type || 'pppoe'} onChange={update}>
+                    <option value="pppoe">PPPoE</option>
+                    <option value="hotspot">Hotspot</option>
+                  </select>
+                </div>
+              )}
               <div className="sm:col-span-2">
                 <label className="form-label" htmlFor="package_name">Package</label>
                 <select id="package_name" name="package_name" className="form-input" value={form.package_name} onChange={update}>

@@ -2,7 +2,7 @@ from celery import shared_task
 from django.utils import timezone
 
 from .models import TenantSubscription
-from .services import write_audit_log
+from .services import iso_now, list_children, ref, set_customer_enabled, write_audit_log
 
 
 @shared_task
@@ -23,3 +23,33 @@ def send_subscription_reminder_sms():
     now = timezone.now()
     soon = now + timezone.timedelta(days=3)
     return TenantSubscription.objects.filter(expires_at__date=soon.date()).count()
+
+
+@shared_task
+def expire_customer_access():
+    now = iso_now()
+    count = 0
+    for tenant in list_children("tenants"):
+        tenant_id = tenant.get("id")
+        if not tenant_id:
+            continue
+        for customer in list_children(f"tenants/{tenant_id}/customers"):
+            expiry = str(customer.get("expiry_date") or "")
+            if not expiry or expiry > now or customer.get("status") == "expired":
+                continue
+            service_type = customer.get("service_type") or "hotspot"
+            username = customer.get("mac_address") if service_type == "tv" else customer.get("username")
+            try:
+                set_customer_enabled({"id": tenant_id, **tenant}, username, service_type, False)
+            except Exception:
+                pass
+            ref(f"tenants/{tenant_id}/customers/{customer['id']}").update(
+                {
+                    "status": "expired",
+                    "auto_reconnect": False,
+                    "expired_at": now,
+                    "updated_at": now,
+                }
+            )
+            count += 1
+    return count

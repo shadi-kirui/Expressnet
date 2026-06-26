@@ -7,10 +7,19 @@ import Modal from '../components/Modal';
 const initialForm = {
   name: '',
   speed: '',
-  duration_days: '',
+  duration_value: '',
+  duration_unit: 'hours',
   price: '',
   is_active: true,
 };
+
+function packageDuration(pkg) {
+  if (pkg.duration_label) return pkg.duration_label;
+  const unit = pkg.duration_unit || 'days';
+  const value = pkg.duration_value || pkg.duration_hours || pkg.duration_days || 1;
+  if (unit === 'hours') return `${value} hour${Number(value) === 1 ? '' : 's'}`;
+  return `${pkg.duration_days || value} day${Number(pkg.duration_days || value) === 1 ? '' : 's'}`;
+}
 
 export default function Packages() {
   const [packages, setPackages] = useState([]);
@@ -51,7 +60,7 @@ export default function Packages() {
     const nextErrors = {};
     if (!form.name.trim()) nextErrors.name = 'Package name is required';
     if (!form.speed.trim()) nextErrors.speed = 'Speed is required';
-    if (!form.duration_days || Number(form.duration_days) <= 0) nextErrors.duration_days = 'Duration must be greater than 0';
+    if (!form.duration_value || Number(form.duration_value) <= 0) nextErrors.duration_value = 'Duration must be greater than 0';
     if (!form.price || Number(form.price) <= 0) nextErrors.price = 'Price must be greater than 0';
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
@@ -76,7 +85,8 @@ export default function Packages() {
     setForm({
       name: 'Unlimited 24 Hours',
       speed: '5M/5M',
-      duration_days: '1',
+      duration_value: '24',
+      duration_unit: 'hours',
       price: '40',
       is_active: true,
     });
@@ -89,7 +99,8 @@ export default function Packages() {
     setForm({
       name: pkg.name || '',
       speed: pkg.speed || '',
-      duration_days: String(pkg.duration_days || ''),
+      duration_value: String(pkg.duration_value || (pkg.duration_unit === 'hours' ? pkg.duration_hours : pkg.duration_days) || ''),
+      duration_unit: pkg.duration_unit || 'days',
       price: String(pkg.price || ''),
       is_active: pkg.is_active !== false,
     });
@@ -105,7 +116,10 @@ export default function Packages() {
     try {
       const payload = {
         ...form,
-        duration_days: Number(form.duration_days),
+        duration_value: Number(form.duration_value),
+        duration_unit: form.duration_unit,
+        duration_days: form.duration_unit === 'hours' ? 1 : Number(form.duration_value),
+        duration_hours: form.duration_unit === 'hours' ? Number(form.duration_value) : Number(form.duration_value) * 24,
         price: Number(form.price),
         is_active: form.is_active,
       };
@@ -256,7 +270,7 @@ export default function Packages() {
                 <tr key={pkg.id} className={index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
                   <td className="table-cell font-medium text-slate-950">{pkg.name}</td>
                   <td className="table-cell">{pkg.speed}</td>
-                  <td className="table-cell">{pkg.duration_days} days</td>
+                  <td className="table-cell">{packageDuration(pkg)}</td>
                   <td className="table-cell font-medium text-slate-950">KES {pkg.price}</td>
                   <td className="table-cell">
                     <button type="button" className={`rounded-full px-2 py-1 text-xs font-semibold ${pkg.is_active === false ? 'bg-slate-100 text-slate-500' : 'bg-emerald-100 text-emerald-700'}`} onClick={() => togglePackage(pkg)}>
@@ -305,9 +319,15 @@ export default function Packages() {
                 {errors.speed && <p className="form-error">{errors.speed}</p>}
               </div>
               <div>
-                <label className="form-label" htmlFor="duration_days">Duration days</label>
-                <input id="duration_days" name="duration_days" type="number" className="form-input" value={form.duration_days} onChange={update} />
-                {errors.duration_days && <p className="form-error">{errors.duration_days}</p>}
+                <label className="form-label" htmlFor="duration_value">Duration</label>
+                <div className="grid grid-cols-[1fr_auto] gap-2">
+                  <input id="duration_value" name="duration_value" type="number" min="1" step="1" className="form-input" value={form.duration_value} onChange={update} />
+                  <select name="duration_unit" className="form-input" value={form.duration_unit} onChange={update}>
+                    <option value="hours">Hours</option>
+                    <option value="days">Days</option>
+                  </select>
+                </div>
+                {errors.duration_value && <p className="form-error">{errors.duration_value}</p>}
               </div>
               <div>
                 <label className="form-label" htmlFor="price">Price</label>

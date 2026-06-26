@@ -1,4 +1,4 @@
-import { CreditCard, KeyRound, Package, Phone, Wifi, X } from 'lucide-react';
+import { CreditCard, KeyRound, Monitor, Package, Phone, Router, Wifi, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
 import { useParams } from 'react-router-dom';
@@ -13,6 +13,9 @@ export default function CustomerPortal() {
   const [tenant, setTenant] = useState(null);
   const [packages, setPackages] = useState([]);
   const [phone, setPhone] = useState('');
+  const [serviceType, setServiceType] = useState('hotspot');
+  const [pppoeUsername, setPppoeUsername] = useState('');
+  const [macAddress, setMacAddress] = useState('');
   const [selectedPackage, setSelectedPackage] = useState(null);
   const [receiptCode, setReceiptCode] = useState('');
   const [recoveredAccess, setRecoveredAccess] = useState(null);
@@ -24,6 +27,8 @@ export default function CustomerPortal() {
   const [error, setError] = useState('');
 
   useEffect(() => {
+    if (window.location.pathname.startsWith('/pppoe/')) setServiceType('pppoe');
+    if (window.location.pathname.startsWith('/tv/')) setServiceType('tv');
     async function load() {
       try {
         const [tenantRes, packagesRes] = await Promise.all([
@@ -61,21 +66,58 @@ export default function CustomerPortal() {
     verify();
   }, [tenantId]);
 
-  const openPayment = (pkg) => {
+  const openPayment = (pkg, type = serviceType) => {
     setSelectedPackage(pkg);
+    setServiceType(type);
     setPhone('');
+    setPppoeUsername('');
+    setMacAddress('');
   };
 
   const closePayment = () => {
     if (!paying) {
       setSelectedPackage(null);
       setPhone('');
+      setPppoeUsername('');
+      setMacAddress('');
     }
+  };
+
+  const serviceCopy = {
+    hotspot: {
+      title: 'Hotspot access',
+      description: 'Pay and receive a username/password for this device.',
+      icon: Wifi,
+    },
+    pppoe: {
+      title: 'PPPoE renewal',
+      description: 'Enter your existing PPPoE username and renew your subscription.',
+      icon: Router,
+    },
+    tv: {
+      title: 'TV internet',
+      description: 'Enter the TV MAC address and pay from this phone or laptop.',
+      icon: Monitor,
+    },
+  };
+
+  const formatDuration = (pkg) => {
+    if (pkg?.duration_label) return pkg.duration_label;
+    if (pkg?.duration_unit === 'hours') return `${pkg.duration_value || pkg.duration_hours || 1} hours`;
+    return `${pkg?.duration_days || 1} days`;
   };
 
   const pay = async () => {
     if (!phone.trim()) {
       toast.error('Enter your phone number');
+      return;
+    }
+    if (serviceType === 'pppoe' && !pppoeUsername.trim()) {
+      toast.error('Enter your PPPoE username');
+      return;
+    }
+    if (serviceType === 'tv' && !macAddress.trim()) {
+      toast.error('Enter the TV MAC address');
       return;
     }
 
@@ -84,6 +126,9 @@ export default function CustomerPortal() {
       const { data } = await publicApi.post(`/public/${tenantId}/pay`, {
         package_id: selectedPackage.id,
         phone,
+        service_type: serviceType,
+        username: pppoeUsername,
+        mac_address: macAddress,
       });
       toast.success(data.message || 'Redirecting to Paystack');
       if (data.authorizationUrl) {
@@ -168,8 +213,14 @@ export default function CustomerPortal() {
               <div className="space-y-1 text-sm">
                 <p className="font-bold">Payment successful. Your access is ready.</p>
                 <p>Package: {verification.package_name}</p>
-                <p>Username: {verification.username}</p>
-                <p>Password: {verification.password}</p>
+                {verification.service_type === 'tv' ? (
+                  <p>TV MAC: {verification.mac_address || verification.username}</p>
+                ) : (
+                  <>
+                    <p>Username: {verification.username}</p>
+                    <p>Password: {verification.password}</p>
+                  </>
+                )}
                 <p>Expires: {verification.expires_at ? new Date(verification.expires_at).toLocaleString() : '-'}</p>
               </div>
             ) : (
@@ -209,8 +260,14 @@ export default function CustomerPortal() {
             {recoveredAccess && (
               <div className="mt-4 rounded-md bg-green-50 p-3 text-sm text-green-800">
                 <p className="font-bold">Access is active</p>
-                <p>Username: {recoveredAccess.username}</p>
-                <p>Password: {recoveredAccess.password}</p>
+                {recoveredAccess.service_type === 'tv' ? (
+                  <p>TV MAC: {recoveredAccess.mac_address || recoveredAccess.username}</p>
+                ) : (
+                  <>
+                    <p>Username: {recoveredAccess.username}</p>
+                    <p>Password: {recoveredAccess.password}</p>
+                  </>
+                )}
                 <p>Expires: {new Date(recoveredAccess.expires_at).toLocaleString()}</p>
               </div>
             )}
@@ -247,15 +304,23 @@ export default function CustomerPortal() {
                   </div>
                 </div>
                 <p className="mt-5 text-3xl font-bold text-slate-900">KES {pkg.price}</p>
-                <p className="mt-1 text-sm text-slate-500">{pkg.duration_days} days access</p>
-                <button
-                  type="button"
-                  className="btn-primary mt-5 w-full"
-                  onClick={() => openPayment(pkg)}
-                >
-                  <CreditCard size={18} />
-                  Pay with Paystack
-                </button>
+                <p className="mt-1 text-sm text-slate-500">{formatDuration(pkg)} access</p>
+                <div className="mt-5 grid gap-2">
+                  {Object.entries(serviceCopy).map(([key, item]) => {
+                    const Icon = item.icon;
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        className={key === 'hotspot' ? 'btn-primary w-full' : 'btn-secondary w-full justify-center'}
+                        onClick={() => openPayment(pkg, key)}
+                      >
+                        <Icon size={18} />
+                        {key === 'hotspot' ? 'Pay Hotspot' : key === 'pppoe' ? 'Renew PPPoE' : 'Pay TV MAC'}
+                      </button>
+                    );
+                  })}
+                </div>
               </article>
             ))}
           </div>
@@ -267,14 +332,45 @@ export default function CustomerPortal() {
           <section className="w-full max-w-md rounded-lg bg-white shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
-                <h2 className="text-lg font-bold text-slate-900">{selectedPackage.name}</h2>
-                <p className="text-sm text-slate-500">KES {selectedPackage.price} for {selectedPackage.duration_days} days</p>
+                <h2 className="text-lg font-bold text-slate-900">{serviceCopy[serviceType].title}</h2>
+                <p className="text-sm text-slate-500">{selectedPackage.name} - KES {selectedPackage.price} for {formatDuration(selectedPackage)}</p>
               </div>
               <button type="button" className="rounded-md p-2 text-slate-500 hover:bg-slate-100" onClick={closePayment} aria-label="Close payment">
                 <X size={20} />
               </button>
             </div>
             <div className="p-5">
+              <p className="mb-4 text-sm text-slate-600">{serviceCopy[serviceType].description}</p>
+              {serviceType === 'pppoe' && (
+                <div className="mb-4">
+                  <label className="form-label" htmlFor="pppoeUsername">PPPoE username</label>
+                  <div className="relative mt-1">
+                    <Router className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                    <input
+                      id="pppoeUsername"
+                      className="form-input mt-0 pl-10"
+                      placeholder="Your PPPoE username"
+                      value={pppoeUsername}
+                      onChange={(event) => setPppoeUsername(event.target.value)}
+                    />
+                  </div>
+                </div>
+              )}
+              {serviceType === 'tv' && (
+                <div className="mb-4">
+                  <label className="form-label" htmlFor="macAddress">TV MAC address</label>
+                  <div className="relative mt-1">
+                    <Monitor className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                    <input
+                      id="macAddress"
+                      className="form-input mt-0 pl-10 uppercase"
+                      placeholder="AA:BB:CC:DD:EE:FF"
+                      value={macAddress}
+                      onChange={(event) => setMacAddress(event.target.value.toUpperCase())}
+                    />
+                  </div>
+                </div>
+              )}
               <label className="form-label" htmlFor="phone">Phone number</label>
               <div className="relative mt-1">
                 <Phone className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />

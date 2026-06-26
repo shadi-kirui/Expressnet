@@ -82,6 +82,7 @@ function DashboardLayout() {
           <Routes>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/customers" element={<Customers />} />
+            <Route path="/pppoe-customers" element={<Customers initialFilter="pppoe" serviceLocked="pppoe" title="PPPoE Customers" />} />
             <Route path="/active-users" element={<Navigate to="/customers" replace />} />
             <Route path="/tickets" element={<IspOperations module="tickets" />} />
             <Route path="/packages" element={<Packages />} />
@@ -117,6 +118,8 @@ export default function App() {
       <Route path="/customers/:tenantId" element={<CustomerPortal />} />
       <Route path="/customer/:tenantId" element={<CustomerPortal />} />
       <Route path="/hotspot/:tenantId" element={<CustomerPortal />} />
+      <Route path="/pppoe/:tenantId" element={<CustomerPortal />} />
+      <Route path="/tv/:tenantId" element={<CustomerPortal />} />
       <Route path="/admin/login" element={<AdminLogin />} />
       <Route element={<AdminProtectedRoute />}>
         <Route path="/admin" element={<AdminLayout />}>

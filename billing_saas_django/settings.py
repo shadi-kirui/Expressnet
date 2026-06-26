@@ -10,7 +10,7 @@ load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY") or "dev-only-change-me"
 DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() == "true"
-ALLOWED_HOSTS = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
+ALLOWED_HOSTS =['*'] #[[host.strip() for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
 
 INSTALLED_APPS = [
     "django.contrib.auth",
@@ -107,5 +107,9 @@ CELERY_BEAT_SCHEDULE = {
     "expire-tenant-subscriptions-hourly": {
         "task": "billing_api.tasks.expire_tenant_subscriptions",
         "schedule": 3600.0,
+    },
+    "expire-customer-access-every-five-minutes": {
+        "task": "billing_api.tasks.expire_customer_access",
+        "schedule": 300.0,
     },
 }

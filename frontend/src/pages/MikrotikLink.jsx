@@ -23,8 +23,8 @@ const initialForm = {
 
 const initialAssignment = {
   interface: '',
-  service_type: 'pppoe',
-  profile: 'default',
+  service_type: 'hotspot',
+  profile: 'billing-saas-captive',
 };
 
 export default function MikrotikSettings() {
@@ -95,7 +95,7 @@ export default function MikrotikSettings() {
     setAssignment((current) => ({
       ...current,
       [name]: value,
-      ...(name === 'service_type' ? { profile: 'default' } : {}),
+      ...(name === 'service_type' ? { profile: value === 'hotspot' ? 'billing-saas-captive' : 'default' } : {}),
     }));
   };
 
@@ -317,15 +317,19 @@ export default function MikrotikSettings() {
                 ))}
               </select>
               <select className="form-input" name="service_type" value={assignment.service_type} onChange={updateAssignment}>
-                <option value="pppoe">PPPoE</option>
                 <option value="hotspot">Hotspot</option>
+                <option value="pppoe">PPPoE</option>
               </select>
-              <select className="form-input" name="profile" value={assignment.profile} onChange={updateAssignment}>
-                <option value="default">default</option>
-                {profiles.map((profile) => (
-                  <option key={profile.name} value={profile.name}>{profile.name}</option>
-                ))}
-              </select>
+              {assignment.service_type === 'hotspot' ? (
+                <input className="form-input" value="billing-saas-captive" readOnly />
+              ) : (
+                <select className="form-input" name="profile" value={assignment.profile} onChange={updateAssignment}>
+                  <option value="default">default</option>
+                  {profiles.map((profile) => (
+                    <option key={profile.name} value={profile.name}>{profile.name}</option>
+                  ))}
+                </select>
+              )}
               <button type="submit" className="btn-primary" disabled={assigning}>
                 {assigning ? 'Assigning...' : 'Assign Port'}
               </button>
