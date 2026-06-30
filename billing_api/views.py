@@ -262,15 +262,17 @@ def health_payload():
             cursor.execute("SELECT 1")
             cursor.fetchone()
         checks["db"] = "ok"
-    except Exception:
+    except Exception as exc:
         checks["db"] = "error"
+        checks["dbError"] = f"{exc.__class__.__name__}: {str(exc)[:240]}"
     try:
         import redis
         from django.conf import settings as django_settings
         redis.Redis.from_url(django_settings.REDIS_URL, socket_connect_timeout=0.5, socket_timeout=0.5).ping()
         checks["redis"] = "ok"
-    except Exception:
+    except Exception as exc:
         checks["redis"] = "error"
+        checks["redisError"] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
     try:
         checks["firebase"] = "ok" if not firebase_backup_configured() else "ok"
     except Exception:
