@@ -1,4 +1,4 @@
-import { CreditCard, KeyRound, Monitor, Package, Phone, Router, Wifi, X } from 'lucide-react';
+import { CreditCard, KeyRound, Monitor, Package, Phone, PlugZap, Wifi, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import toast from 'react-hot-toast';
 import { useParams } from 'react-router-dom';
@@ -8,12 +8,22 @@ const publicApi = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || 'https://genco-production.up.railway.app/api',
 });
 
+function packageType(pkg) {
+  return pkg?.service_type === 'pppoe' ? 'pppoe' : 'hotspot';
+}
+
+function pathServiceType() {
+  if (window.location.pathname.startsWith('/pppoe/')) return 'pppoe';
+  if (window.location.pathname.startsWith('/hotspot/')) return 'hotspot';
+  return '';
+}
+
 export default function CustomerPortal() {
   const { tenantId } = useParams();
   const [tenant, setTenant] = useState(null);
   const [packages, setPackages] = useState([]);
   const [phone, setPhone] = useState('');
-  const [serviceType, setServiceType] = useState('hotspot');
+  const [serviceType, setServiceType] = useState(pathServiceType() || 'hotspot');
   const [pppoeUsername, setPppoeUsername] = useState('');
   const [macAddress, setMacAddress] = useState('');
   const [selectedPackage, setSelectedPackage] = useState(null);
@@ -27,13 +37,14 @@ export default function CustomerPortal() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (window.location.pathname.startsWith('/pppoe/')) setServiceType('pppoe');
-    if (window.location.pathname.startsWith('/tv/')) setServiceType('tv');
+    const routeServiceType = pathServiceType();
+    if (routeServiceType) setServiceType(routeServiceType);
     async function load() {
       try {
+        const packageUrl = routeServiceType ? `/public/${tenantId}/packages?service_type=${routeServiceType}` : `/public/${tenantId}/packages`;
         const [tenantRes, packagesRes] = await Promise.all([
           publicApi.get(`/public/${tenantId}`),
-          publicApi.get(`/public/${tenantId}/packages`),
+          publicApi.get(packageUrl),
         ]);
         setTenant(tenantRes.data);
         setPackages(Array.isArray(packagesRes.data) ? packagesRes.data : []);
@@ -90,9 +101,9 @@ export default function CustomerPortal() {
       icon: Wifi,
     },
     pppoe: {
-      title: 'PPPoE renewal',
-      description: 'Enter your existing PPPoE username and renew your subscription.',
-      icon: Router,
+      title: 'PPPoE access',
+      description: 'Enter your PPPoE username. Your account will be reactivated after payment.',
+      icon: PlugZap,
     },
     tv: {
       title: 'TV internet',
@@ -300,23 +311,24 @@ export default function CustomerPortal() {
                     <p className="mt-1 text-sm text-slate-500">{pkg.speed}</p>
                   </div>
                   <div className="rounded-md bg-blue-50 p-2 text-blue-600">
-                    <Wifi size={20} />
+                    {packageType(pkg) === 'pppoe' ? <PlugZap size={20} /> : <Wifi size={20} />}
                   </div>
                 </div>
                 <p className="mt-5 text-3xl font-bold text-slate-900">KES {pkg.price}</p>
                 <p className="mt-1 text-sm text-slate-500">{formatDuration(pkg)} access</p>
                 <div className="mt-5 grid gap-2">
-                  {Object.entries(serviceCopy).map(([key, item]) => {
+                  {[packageType(pkg), ...(packageType(pkg) === 'hotspot' ? ['tv'] : [])].map((key) => {
+                    const item = serviceCopy[key];
                     const Icon = item.icon;
                     return (
                       <button
                         key={key}
                         type="button"
-                        className={key === 'hotspot' ? 'btn-primary w-full' : 'btn-secondary w-full justify-center'}
+                        className={key === packageType(pkg) ? 'btn-primary w-full' : 'btn-secondary w-full justify-center'}
                         onClick={() => openPayment(pkg, key)}
                       >
                         <Icon size={18} />
-                        {key === 'hotspot' ? 'Pay Hotspot' : key === 'pppoe' ? 'Renew PPPoE' : 'Pay TV MAC'}
+                        {key === 'hotspot' ? 'Pay Hotspot' : key === 'pppoe' ? 'Pay PPPoE' : 'Pay TV MAC'}
                       </button>
                     );
                   })}
@@ -345,7 +357,7 @@ export default function CustomerPortal() {
                 <div className="mb-4">
                   <label className="form-label" htmlFor="pppoeUsername">PPPoE username</label>
                   <div className="relative mt-1">
-                    <Router className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+                    <PlugZap className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                     <input
                       id="pppoeUsername"
                       className="form-input mt-0 pl-10"
@@ -356,6 +368,7 @@ export default function CustomerPortal() {
                   </div>
                 </div>
               )}
+            
               {serviceType === 'tv' && (
                 <div className="mb-4">
                   <label className="form-label" htmlFor="macAddress">TV MAC address</label>

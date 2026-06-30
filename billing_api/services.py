@@ -608,6 +608,11 @@ def create_hotspot_profile(tenant, name, speed):
     return upsert_router_profile(tenant, ("ip", "hotspot", "user", "profile"), name, speed)
 
 
+def package_service_type(package):
+    service_type = str((package or {}).get("service_type") or "").strip().lower()
+    return service_type if service_type in {"hotspot", "pppoe"} else "hotspot"
+
+
 def captive_portal_url(tenant):
     base = get_public_base_url().rstrip("/")
     return f"{base}/portal/{tenant.get('id')}"
@@ -663,7 +668,7 @@ def ensure_hotspot_captive_portal(tenant):
             {"name": profile_name},
             {
                 "name": profile_name,
-                "login-by": "http-chap,http-pap",
+                "login-by": "http-pap,http-chap",
                 "use-radius": "no",
                 "html-directory": "hotspot",
                 "comment": f"billing-saas captive portal: {portal_url}",
@@ -894,6 +899,44 @@ def delete_router_customer(tenant, username, service_type="pppoe"):
         return api.path(*path).remove(existing[".id"])
     finally:
         api.close()
+
+
+def whatsapp_enabled(tenant=None):
+    if tenant and tenant.get("whatsapp_enabled") is False:
+        return False
+    return os.getenv("WHATSAPP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def send_whatsapp_message(phone, message, tenant=None):
+    if not whatsapp_enabled(tenant):
+        return {"sent": False, "skipped": "disabled"}
+    token = os.getenv("WHATSAPP_API_TOKEN") or os.getenv("WHATSAPP_ACCESS_TOKEN")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    api_url = os.getenv("WHATSAPP_API_URL", "").strip()
+    if not api_url and phone_number_id:
+        version = os.getenv("WHATSAPP_API_VERSION", "v20.0")
+        api_url = f"https://graph.facebook.com/{version}/{phone_number_id}/messages"
+    if not token or not api_url:
+        return {"sent": False, "skipped": "missing_credentials"}
+
+    recipient = normalize_phone(phone)
+    if not recipient:
+        return {"sent": False, "skipped": "missing_phone"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "text",
+        "text": {"preview_url": False, "body": str(message or "")},
+    }
+    response = requests.post(
+        api_url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return {"sent": True, "response": response.json() if response.content else {}}
 
 
 def write_audit_log(admin_id=None, admin_email=None, action=None, target_id=None, target_type=None, request=None, metadata=None):

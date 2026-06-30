@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { BookOpen, PackagePlus, RefreshCw, Router, Search, Sparkles } from 'lucide-react';
+import { BookOpen, PackagePlus, PlugZap, RefreshCw, Router, Search, Sparkles, Wifi } from 'lucide-react';
 import toast from 'react-hot-toast';
 import api from '../api/axios';
 import Modal from '../components/Modal';
 
 const initialForm = {
+  service_type: 'hotspot',
   name: '',
   speed: '',
   duration_value: '',
@@ -19,6 +20,10 @@ function packageDuration(pkg) {
   const value = pkg.duration_value || pkg.duration_hours || pkg.duration_days || 1;
   if (unit === 'hours') return `${value} hour${Number(value) === 1 ? '' : 's'}`;
   return `${pkg.duration_days || value} day${Number(pkg.duration_days || value) === 1 ? '' : 's'}`;
+}
+
+function packageType(pkg) {
+  return pkg.service_type === 'pppoe' ? 'pppoe' : 'hotspot';
 }
 
 export default function Packages() {
@@ -52,7 +57,11 @@ export default function Packages() {
 
   const update = (event) => {
     const { checked, name, type, value } = event.target;
-    setForm((current) => ({ ...current, [name]: type === 'checkbox' ? checked : value }));
+    setForm((current) => ({
+      ...current,
+      [name]: type === 'checkbox' ? checked : value,
+      ...(name === 'service_type' && value === 'pppoe' ? { duration_unit: 'days' } : {}),
+    }));
     setErrors((current) => ({ ...current, [event.target.name]: '' }));
   };
 
@@ -61,6 +70,7 @@ export default function Packages() {
     if (!form.name.trim()) nextErrors.name = 'Package name is required';
     if (!form.speed.trim()) nextErrors.speed = 'Speed is required';
     if (!form.duration_value || Number(form.duration_value) <= 0) nextErrors.duration_value = 'Duration must be greater than 0';
+    if (form.service_type === 'pppoe' && form.duration_unit === 'hours') nextErrors.duration_value = 'PPPoE packages must use days';
     if (!form.price || Number(form.price) <= 0) nextErrors.price = 'Price must be greater than 0';
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
@@ -97,10 +107,11 @@ export default function Packages() {
   const openEditModal = (pkg) => {
     setEditingPackage(pkg);
     setForm({
+      service_type: packageType(pkg),
       name: pkg.name || '',
       speed: pkg.speed || '',
       duration_value: String(pkg.duration_value || (pkg.duration_unit === 'hours' ? pkg.duration_hours : pkg.duration_days) || ''),
-      duration_unit: pkg.duration_unit || 'days',
+      duration_unit: packageType(pkg) === 'pppoe' ? 'days' : pkg.duration_unit || 'days',
       price: String(pkg.price || ''),
       is_active: pkg.is_active !== false,
     });
@@ -116,10 +127,11 @@ export default function Packages() {
     try {
       const payload = {
         ...form,
+        service_type: form.service_type,
         duration_value: Number(form.duration_value),
-        duration_unit: form.duration_unit,
-        duration_days: form.duration_unit === 'hours' ? 1 : Number(form.duration_value),
-        duration_hours: form.duration_unit === 'hours' ? Number(form.duration_value) : Number(form.duration_value) * 24,
+        duration_unit: form.service_type === 'pppoe' ? 'days' : form.duration_unit,
+        duration_days: form.service_type !== 'pppoe' && form.duration_unit === 'hours' ? 1 : Number(form.duration_value),
+        duration_hours: form.service_type !== 'pppoe' && form.duration_unit === 'hours' ? Number(form.duration_value) : Number(form.duration_value) * 24,
         price: Number(form.price),
         is_active: form.is_active,
       };
@@ -184,15 +196,15 @@ export default function Packages() {
     const matchesSearch = text.includes(search.toLowerCase());
     if (!matchesSearch) return false;
     if (filter === 'free') return text.includes('free') || Number(pkg.price || 0) === 0;
-    if (filter === 'pppoe') return text.includes('pppoe') || text.includes('fiber');
-    if (filter === 'hotspot') return !text.includes('pppoe') && !text.includes('fiber');
+    if (filter === 'pppoe') return packageType(pkg) === 'pppoe';
+    if (filter === 'hotspot') return packageType(pkg) === 'hotspot';
     return true;
   });
 
   const counts = {
     all: packages.length,
-    hotspot: packages.filter((pkg) => !`${pkg.name || ''}`.toLowerCase().includes('pppoe')).length,
-    pppoe: packages.filter((pkg) => `${pkg.name || ''}`.toLowerCase().includes('pppoe')).length,
+    hotspot: packages.filter((pkg) => packageType(pkg) === 'hotspot').length,
+    pppoe: packages.filter((pkg) => packageType(pkg) === 'pppoe').length,
     free: packages.filter((pkg) => Number(pkg.price || 0) === 0 || `${pkg.name || ''}`.toLowerCase().includes('free')).length,
   };
 
@@ -253,6 +265,7 @@ export default function Packages() {
             <thead className="table-head">
               <tr>
                 <th className="px-4 py-3">Name</th>
+                <th className="px-4 py-3">Type</th>
                 <th className="px-4 py-3">Speed</th>
                 <th className="px-4 py-3">Duration</th>
                 <th className="px-4 py-3">Price</th>
@@ -263,12 +276,18 @@ export default function Packages() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading ? (
-                <tr><td className="table-cell text-slate-500" colSpan="7">Loading packages...</td></tr>
+                <tr><td className="table-cell text-slate-500" colSpan="8">Loading packages...</td></tr>
               ) : filteredPackages.length === 0 ? (
-                <tr><td className="table-cell text-slate-500" colSpan="7">No packages found.</td></tr>
+                <tr><td className="table-cell text-slate-500" colSpan="8">No packages found.</td></tr>
               ) : filteredPackages.map((pkg, index) => (
                 <tr key={pkg.id} className={index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
                   <td className="table-cell font-medium text-slate-950">{pkg.name}</td>
+                  <td className="table-cell">
+                    <span className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-1 text-xs font-semibold uppercase text-slate-700">
+                      {packageType(pkg) === 'pppoe' ? <PlugZap size={13} /> : <Wifi size={13} />}
+                      {packageType(pkg)}
+                    </span>
+                  </td>
                   <td className="table-cell">{pkg.speed}</td>
                   <td className="table-cell">{packageDuration(pkg)}</td>
                   <td className="table-cell font-medium text-slate-950">KES {pkg.price}</td>
@@ -308,6 +327,21 @@ export default function Packages() {
         <Modal title={editingPackage ? 'Edit Package' : 'Add Package'} onClose={closeModal}>
           <form className="space-y-4" onSubmit={savePackage}>
             <div className="grid gap-4 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <label className="form-label" htmlFor="service_type">Package type</label>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {[
+                    ['hotspot', Wifi, 'Hotspot'],
+                    ['pppoe', PlugZap, 'PPPoE'],
+                  ].map(([key, Icon, label]) => (
+                    <label key={key} className={`flex cursor-pointer items-center gap-3 rounded-md border p-3 text-sm font-semibold ${form.service_type === key ? 'border-app-navy bg-app-navy text-white' : 'border-slate-200 bg-white text-slate-700'}`}>
+                      <input className="sr-only" type="radio" name="service_type" value={key} checked={form.service_type === key} onChange={update} />
+                      <Icon size={18} />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </div>
               <div>
                 <label className="form-label" htmlFor="name">Name</label>
                 <input id="name" name="name" className="form-input" value={form.name} onChange={update} />
@@ -322,8 +356,8 @@ export default function Packages() {
                 <label className="form-label" htmlFor="duration_value">Duration</label>
                 <div className="grid grid-cols-[1fr_auto] gap-2">
                   <input id="duration_value" name="duration_value" type="number" min="1" step="1" className="form-input" value={form.duration_value} onChange={update} />
-                  <select name="duration_unit" className="form-input" value={form.duration_unit} onChange={update}>
-                    <option value="hours">Hours</option>
+                  <select name="duration_unit" className="form-input" value={form.service_type === 'pppoe' ? 'days' : form.duration_unit} onChange={update} disabled={form.service_type === 'pppoe'}>
+                    {form.service_type !== 'pppoe' && <option value="hours">Hours</option>}
                     <option value="days">Days</option>
                   </select>
                 </div>

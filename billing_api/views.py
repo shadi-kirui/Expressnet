@@ -42,11 +42,13 @@ from .services import (
     firebase_backup_configured,
     list_children,
     normalize_phone,
+    package_service_type,
     PaymentProviderError,
     ref,
     _get_jwt_secret,
     router_interface_status,
     router_items,
+    send_whatsapp_message,
     set_customer_enabled,
     tenant_token,
     upsert_customer_access,
@@ -201,6 +203,34 @@ def package_duration_delta(package):
         return timedelta(days=int((package or {}).get("duration_days") or 1))
     except (TypeError, ValueError):
         return timedelta(days=1)
+
+
+def normalized_package_payload(data):
+    service_type = str((data or {}).get("service_type") or "hotspot").strip().lower()
+    if service_type not in {"hotspot", "pppoe"}:
+        service_type = "hotspot"
+    duration_unit = "hours" if str((data or {}).get("duration_unit") or "").lower().startswith("hour") else "days"
+    if service_type == "pppoe":
+        duration_unit = "days"
+    duration_value = float((data or {}).get("duration_value") or (data or {}).get("duration_hours") or (data or {}).get("duration_days") or 1)
+    if service_type == "pppoe" and duration_value < 1:
+        duration_value = 1
+    duration_days = 1 if duration_unit == "hours" else int(duration_value)
+    duration_hours = duration_value if duration_unit == "hours" else duration_value * 24
+    return {
+        "service_type": service_type,
+        "duration_unit": duration_unit,
+        "duration_value": duration_value,
+        "duration_days": duration_days,
+        "duration_hours": duration_hours,
+    }
+
+
+def sync_package_profile(tenant, package):
+    service_type = package_service_type(package)
+    if service_type == "pppoe":
+        return create_ppp_profile(tenant, package.get("name"), package.get("speed"))
+    return create_hotspot_profile(tenant, package.get("name"), package.get("speed"))
 
 
 def package_duration_label(package):
@@ -511,13 +541,15 @@ def public_packages(request, tenant_id):
         return ok({"message": "Tenant not found"}, 404)
     if tenant.get("status") == "suspended":
         return ok({"message": "Tenant is not accepting payments"}, 403)
+    requested_service = str(request.GET.get("service_type") or "").strip().lower()
     packages = [
         {
-            **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price"]},
+            **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "service_type"]},
+            "service_type": package_service_type(pkg),
             "duration_label": package_duration_label(pkg),
         }
         for pkg in list_children(f"tenants/{tenant_id}/packages")
-        if pkg.get("is_active") is not False
+        if pkg.get("is_active") is not False and (requested_service not in {"hotspot", "pppoe"} or package_service_type(pkg) == requested_service)
     ]
     return ok(sorted(packages, key=lambda item: float(item.get("price") or 0)))
 
@@ -541,6 +573,11 @@ def public_pay(request, tenant_id):
     service_type = str(data.get("service_type") or "hotspot").strip().lower()
     if service_type not in {"hotspot", "pppoe", "tv"}:
         return ok({"message": "Invalid service type"}, 400)
+    package_type = package_service_type(pkg)
+    if service_type in {"hotspot", "pppoe"} and service_type != package_type:
+        return ok({"message": f"This package is only available for {package_type.upper()} customers"}, 400)
+    if service_type == "tv" and package_type != "hotspot":
+        return ok({"message": "TV MAC access is only available for hotspot packages"}, 400)
     customer = None
     mac_address = ""
     if service_type == "pppoe":
@@ -814,29 +851,22 @@ def packages(request, package_id=None):
         return as_collection_response(request, list_children(f"tenants/{tenant_id}/packages"))
     if method(request, "PATCH") and package_id:
         data = body(request)
-        updates = {key: data[key] for key in ["name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "is_active"] if key in data}
+        updates = {key: data[key] for key in ["name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "is_active", "service_type"] if key in data}
         if not updates:
             return ok({"message": "No package fields provided"}, 400)
-        if "duration_unit" in updates:
-            updates["duration_unit"] = "hours" if str(updates["duration_unit"]).lower().startswith("hour") else "days"
-        if "duration_value" in updates:
-            updates["duration_value"] = float(updates["duration_value"])
-        if "duration_days" in updates:
-            updates["duration_days"] = int(updates["duration_days"])
-        if "duration_hours" in updates:
-            updates["duration_hours"] = float(updates["duration_hours"])
         if "price" in updates:
             updates["price"] = float(updates["price"])
         if "is_active" in updates:
             updates["is_active"] = bool(updates["is_active"])
+        if any(key in data for key in ["service_type", "duration_unit", "duration_value", "duration_days", "duration_hours"]):
+            updates.update(normalized_package_payload({**data, **updates}))
         existing = ref(f"tenants/{tenant_id}/packages/{package_id}").get()
         if not existing:
             return ok({"message": "Package not found"}, 404)
         router_updates = {"updated_at": iso_now()}
         if has_mikrotik_credentials(request.tenant):
             try:
-                create_hotspot_profile(request.tenant, updates.get("name", existing.get("name")), updates.get("speed", existing.get("speed")))
-                create_ppp_profile(request.tenant, updates.get("name", existing.get("name")), updates.get("speed", existing.get("speed")))
+                sync_package_profile(request.tenant, {**existing, **updates})
                 router_updates.update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
             except Exception as exc:
                 router_updates.update({"ppp_profile_status": "failed", "ppp_profile_error": str(exc)})
@@ -857,18 +887,14 @@ def package_add(request):
     data = body(request)
     if any(not data.get(field) for field in ["name", "speed", "price"]):
         return ok({"message": "All package fields are required"}, 400)
-    duration_unit = "hours" if str(data.get("duration_unit") or "").lower().startswith("hour") else "days"
-    duration_value = float(data.get("duration_value") or data.get("duration_hours") or data.get("duration_days") or 1)
-    duration_days = 1 if duration_unit == "hours" else int(duration_value)
-    duration_hours = duration_value if duration_unit == "hours" else duration_value * 24
+    package_payload = normalized_package_payload(data)
     if find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", data["name"]):
         return ok({"message": "A package with this name already exists"}, 409)
     router_synced = False
     router_error = None
     if has_mikrotik_credentials(request.tenant):
         try:
-            create_hotspot_profile(request.tenant, data["name"], data["speed"])
-            create_ppp_profile(request.tenant, data["name"], data["speed"])
+            sync_package_profile(request.tenant, {**data, **package_payload})
             router_synced = True
         except Exception as exc:
             router_error = str(exc)
@@ -876,10 +902,7 @@ def package_add(request):
         {
             "name": data["name"],
             "speed": data["speed"],
-            "duration_days": duration_days,
-            "duration_unit": duration_unit,
-            "duration_value": duration_value,
-            "duration_hours": duration_hours,
+            **package_payload,
             "price": float(data["price"]),
             "is_active": data.get("is_active") is not False,
             "ppp_profile_status": "synced" if router_synced else "pending",
@@ -888,7 +911,7 @@ def package_add(request):
             "created_at": iso_now(),
         }
     )
-    message = "Package and MikroTik profiles created" if router_synced else "Package created. Sync router after MikroTik is connected."
+    message = "Package and MikroTik profile created" if router_synced else "Package created. Sync router after MikroTik is connected."
     return ok({"success": True, "message": message, "packageId": new_ref.key}, 201)
 
 
@@ -1011,15 +1034,14 @@ def package_sync(request, package_id=None):
     results = []
     for pkg in packages_to_sync:
         try:
-            create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
-            create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
+            sync_package_profile(request.tenant, pkg)
             ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
             results.append({"id": pkg["id"], "name": pkg["name"], "success": True})
         except Exception as exc:
             ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "failed", "ppp_profile_error": str(exc), "ppp_profile_failed_at": iso_now()})
             results.append({"id": pkg["id"], "name": pkg.get("name"), "success": False, "message": str(exc)})
     if package_id:
-        return ok({"success": True, "message": "MikroTik hotspot profile synced"})
+        return ok({"success": True, "message": "MikroTik package profile synced"})
     synced = len([r for r in results if r["success"]])
     failed = len(results) - synced
     return ok({"success": failed == 0, "message": "All package profiles synced" if failed == 0 else f"{synced} package profiles synced, {failed} failed", "synced": synced, "failed": failed, "results": results})
@@ -1548,9 +1570,9 @@ def settings_notifications(request):
     if method(request, "GET"):
         return ok(
             {
-                "provider": request.tenant.get("notification_provider") or "roamtech",
+                "provider": request.tenant.get("notification_provider") or "whatsapp_cloud",
                 "sms_enabled": request.tenant.get("sms_enabled") is not False,
-                "whatsapp_enabled": bool(request.tenant.get("whatsapp_enabled")),
+                "whatsapp_enabled": bool(request.tenant.get("whatsapp_enabled")) or os.getenv("WHATSAPP_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
                 "roamtech_sender_id": request.tenant.get("roamtech_sender_id") or "",
                 "payment_sms_template": request.tenant.get("payment_sms_template") or "Hi {{name}}, your {{package}} payment of Ksh {{amount}} is confirmed. Username: {{username}}, Password: {{password}}.",
                 "payment_whatsapp_template": request.tenant.get("payment_whatsapp_template") or "Hi {{name}}, your {{package}} internet package is active. Amount: Ksh {{amount}}. Username: {{username}}, Password: {{password}}.",
@@ -1558,7 +1580,7 @@ def settings_notifications(request):
         )
     data = body(request)
     updates = {
-        "notification_provider": "roamtech",
+        "notification_provider": str(data.get("provider") or "whatsapp_cloud").strip(),
         "sms_enabled": data.get("sms_enabled") is not False,
         "whatsapp_enabled": bool(data.get("whatsapp_enabled")),
         "roamtech_sender_id": str(data.get("roamtech_sender_id") or "").strip(),
@@ -1567,11 +1589,36 @@ def settings_notifications(request):
         "notifications_updated_at": iso_now(),
     }
     ref(f"tenants/{request.tenant['id']}").update(updates)
-    return ok({"success": True, "message": "Roamtech notification settings saved", "config": updates})
+    return ok({"success": True, "message": "Notification settings saved", "config": updates})
 
 
 def to_access_username(phone):
     return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
+def render_notification_template(template, context):
+    rendered = str(template or "")
+    for key, value in context.items():
+        rendered = rendered.replace("{{" + key + "}}", str(value if value is not None else ""))
+    return rendered
+
+
+def notify_payment_access(tenant, payment, access):
+    if not ((tenant or {}).get("whatsapp_enabled") or os.getenv("WHATSAPP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}):
+        return None
+    template = (tenant or {}).get("payment_whatsapp_template") or "Hi {{name}}, your {{package}} internet package is active. Amount: Ksh {{amount}}. Username: {{username}}, Password: {{password}}."
+    message = render_notification_template(
+        template,
+        {
+            "name": payment.get("customer_name") or payment.get("phone") or "customer",
+            "package": payment.get("package_name") or "",
+            "amount": payment.get("amount") or "",
+            "username": access.get("username") or access.get("mac_address") or "",
+            "password": access.get("password") or "",
+            "expires_at": access.get("expiry_date") or "",
+        },
+    )
+    return send_whatsapp_message(payment.get("phone"), message, tenant)
 
 
 def activate_paid_access(tenant, payment_id, payment, phone, payment_code):
@@ -1603,12 +1650,21 @@ def activate_paid_access(tenant, payment_id, payment, phone, payment_code):
         customer_id = new_ref.key
     if service_type == "hotspot" and pkg:
         create_hotspot_profile(tenant, pkg["name"], pkg.get("speed"))
+    if service_type == "pppoe" and pkg:
+        create_ppp_profile(tenant, pkg["name"], pkg.get("speed"))
     if service_type == "tv" and not mac_address:
         raise ValueError("TV MAC address is required for activation")
     upsert_customer_access(tenant, {"username": username, "password": password, "package_name": package_for_access, "service_type": service_type, "mac_address": mac_address})
     set_customer_enabled(tenant, username, service_type, True)
     ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"customer_id": customer_id, "access_username": username, "access_password": password, "access_mac_address": mac_address, "access_expires_at": expiry.isoformat(), "access_status": "active", "auto_reconnect": True})
-    return {"username": username, "password": password, "mac_address": mac_address, "expiry_date": expiry.isoformat()}
+    access = {"username": username, "password": password, "mac_address": mac_address, "expiry_date": expiry.isoformat()}
+    try:
+        notify_result = notify_payment_access(tenant, {**payment, "phone": phone, "package_name": package_for_access}, access)
+        if notify_result:
+            ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"whatsapp_status": "sent" if notify_result.get("sent") else "skipped", "whatsapp_detail": notify_result.get("skipped") or ""})
+    except Exception as exc:
+        ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"whatsapp_status": "failed", "whatsapp_detail": str(exc)})
+    return access
 
 
 def find_payment_by_paystack_reference(reference, tenant_id=None, payment_id=None):

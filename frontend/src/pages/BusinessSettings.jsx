@@ -104,6 +104,14 @@ function fromApi(data) {
   };
 }
 
+function notificationsFromApi(data) {
+  return {
+    whatsappProvider: data.provider || data.notification_provider || initialSettings.whatsappProvider,
+    whatsappTemplate: data.payment_whatsapp_template || initialSettings.whatsappTemplate,
+    notifyPayment: data.whatsapp_enabled ?? initialSettings.notifyPayment,
+  };
+}
+
 function toApi(settings) {
   return {
     business_name: settings.companyName,
@@ -192,9 +200,12 @@ export default function BusinessSettings() {
     let mounted = true;
     async function loadSettings() {
       try {
-        const { data } = await api.get('/settings/business');
+        const [{ data }, notifications] = await Promise.all([
+          api.get('/settings/business'),
+          api.get('/settings/notifications').catch(() => ({ data: {} })),
+        ]);
         if (mounted) {
-          setSettings((current) => ({ ...current, ...fromApi(data) }));
+          setSettings((current) => ({ ...current, ...fromApi(data), ...notificationsFromApi(notifications.data) }));
         }
       } catch (error) {
         toast.error(error.response?.data?.message || 'Failed to load business settings');
@@ -224,8 +235,13 @@ export default function BusinessSettings() {
     setSaving(true);
     try {
       const { data } = await api.patch('/settings/business', toApi(settings));
+      const { data: notifications } = await api.patch('/settings/notifications', {
+        provider: settings.whatsappProvider,
+        whatsapp_enabled: settings.notifyPayment,
+        payment_whatsapp_template: settings.whatsappTemplate,
+      });
       if (data.config) {
-        setSettings((current) => ({ ...current, ...fromApi(data.config) }));
+        setSettings((current) => ({ ...current, ...fromApi(data.config), ...notificationsFromApi(notifications.config || notifications) }));
       }
       toast.success(data.message || 'Settings saved');
     } catch (error) {
