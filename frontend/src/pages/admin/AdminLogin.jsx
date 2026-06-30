@@ -4,6 +4,7 @@ import toast from 'react-hot-toast';
 import { useLocation, useNavigate } from 'react-router-dom';
 import adminApi from '../../api/adminAxios';
 import { useAdminAuth } from '../../context/AdminAuthContext';
+import { ADMIN_DASHBOARD_PATH } from '../../config/adminPaths';
 
 export default function AdminLogin() {
   const navigate = useNavigate();
@@ -32,7 +33,7 @@ export default function AdminLogin() {
       const { data } = await adminApi.post('/admin/auth/login', form);
       loginAdmin(data.token, data.admin);
       toast.success('Admin session started');
-      navigate(location.state?.from?.pathname || '/admin/dashboard', { replace: true });
+      navigate(location.state?.from?.pathname || ADMIN_DASHBOARD_PATH, { replace: true });
     } catch (error) {
       toast.error(error.response?.data?.error || error.response?.data?.message || error.message || 'Admin login failed');
     } finally {

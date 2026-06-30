@@ -112,7 +112,8 @@ def send_system_email(subject, message, recipients):
 
 
 def notify_admins_tenant_signup(tenant_id, tenant):
-    dashboard_url = os.getenv("ADMIN_TENANTS_URL", "/admin/tenants")
+    default_dashboard_url = f"/{settings.ADMIN_FRONTEND_PATH}/tenants"
+    dashboard_url = os.getenv("ADMIN_TENANTS_URL", default_dashboard_url)
     send_system_email(
         "New tenant account pending activation",
         (

@@ -34,6 +34,7 @@ import Profile from './pages/Profile';
 import Register from './pages/Register';
 import Reports from './pages/Reports';
 import Vouchers from './pages/Vouchers';
+import { ADMIN_DASHBOARD_PATH, ADMIN_LOGIN_PATH, ADMIN_PATH, adminPath } from './config/adminPaths';
 
 function softenColor(color) {
   const parts = [0, 2, 4].map((start) => parseInt(color.slice(1).slice(start, start + 2), 16));
@@ -111,7 +112,7 @@ export default function App() {
 
   return (
     <Routes>
-      <Route path="/" element={isAdminHost ? <Navigate to="/admin/login" replace /> : <Home />} />
+      <Route path="/" element={isAdminHost ? <Navigate to={ADMIN_LOGIN_PATH} replace /> : <Home />} />
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route path="/portal/:tenantId" element={<CustomerPortal />} />
@@ -120,10 +121,10 @@ export default function App() {
       <Route path="/hotspot/:tenantId" element={<CustomerPortal />} />
       <Route path="/pppoe/:tenantId" element={<CustomerPortal />} />
       <Route path="/tv/:tenantId" element={<CustomerPortal />} />
-      <Route path="/admin/login" element={<AdminLogin />} />
+      <Route path={`${ADMIN_PATH}/login`} element={<AdminLogin />} />
       <Route element={<AdminProtectedRoute />}>
-        <Route path="/admin" element={<AdminLayout />}>
-          <Route index element={<Navigate to="/admin/dashboard" replace />} />
+        <Route path={ADMIN_PATH} element={<AdminLayout />}>
+          <Route index element={<Navigate to={ADMIN_DASHBOARD_PATH} replace />} />
           <Route path="dashboard" element={<AdminDashboard />} />
           <Route path="tenants" element={<AdminTenants />} />
           <Route path="tenants/:id" element={<AdminTenantDetail />} />
@@ -134,6 +135,12 @@ export default function App() {
           <Route path="audit" element={<AdminAuditLog />} />
         </Route>
       </Route>
+      {ADMIN_PATH !== '/admin' && (
+        <>
+          <Route path="/admin/login" element={<Navigate to={ADMIN_LOGIN_PATH} replace />} />
+          <Route path="/admin" element={<Navigate to={adminPath('dashboard')} replace />} />
+        </>
+      )}
       <Route element={<ProtectedRoute />}>
         <Route path="/*" element={<DashboardLayout />} />
       </Route>

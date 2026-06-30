@@ -25,18 +25,22 @@ class SecurityHeadersMiddleware:
 class SimpleRateLimitMiddleware:
     buckets = defaultdict(deque)
 
-    RULES = {
-        ("POST", "/api/auth/login"): (5, 15 * 60),
-        ("POST", "/api/auth/register"): (5, 15 * 60),
-        ("POST", "/api/admin/auth/login"): (5, 15 * 60),
-    }
-
     def __init__(self, get_response):
         self.get_response = get_response
 
+    def rules(self):
+        api_base = settings.API_BASE_PATH.strip("/")
+        admin_base = settings.ADMIN_API_PATH.strip("/")
+        return {
+            ("POST", f"/{api_base}/auth/login"): (5, 15 * 60),
+            ("POST", f"/{api_base}/auth/register"): (5, 15 * 60),
+            ("POST", f"/{api_base}/{admin_base}/auth/login"): (5, 15 * 60),
+        }
+
     def __call__(self, request):
-        rule = self.RULES.get((request.method.upper(), request.path.rstrip("/")))
-        if request.method.upper() == "POST" and request.path.startswith("/api/public/") and request.path.rstrip("/").endswith("/pay"):
+        api_base = settings.API_BASE_PATH.strip("/")
+        rule = self.rules().get((request.method.upper(), request.path.rstrip("/")))
+        if request.method.upper() == "POST" and request.path.startswith(f"/{api_base}/public/") and request.path.rstrip("/").endswith("/pay"):
             rule = (10, 10 * 60)
         if rule:
             limit, window = rule

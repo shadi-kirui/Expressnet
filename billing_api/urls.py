@@ -1,7 +1,34 @@
-from django.urls import path
+from django.conf import settings
+from django.urls import include, path
 
 from . import views
 
+
+admin_urlpatterns = [
+    path("auth/login", views.admin_login),
+    path("tenants", views.admin_tenants),
+    path("tenants/", views.admin_tenants),
+    path("tenants/stats/summary", views.admin_stats),
+    path("system/stats", views.admin_system_stats),
+    path("system", views.admin_system),
+    path("system/migrations", views.admin_system_migrations),
+    path("subscriptions", views.admin_subscriptions),
+    path("subscriptions/revenue-chart", views.admin_revenue_chart),
+    path("subscriptions/<int:subscription_id>", views.admin_subscriptions),
+    path("subscriptions/<int:subscription_id>/payments", views.admin_subscription_payments),
+    path("tenants/<str:tenant_id>/subscription", views.admin_tenant_subscription),
+    path("tenants/<str:tenant_id>/subscription/remind", views.admin_subscription_remind),
+    path("tenants/<str:tenant_id>/mikrotik/test", views.admin_mikrotik_test),
+    path("tenants/audit/logs", views.admin_audit_logs),
+    path("tenants/<str:tenant_id>", views.admin_tenants),
+    path("tenants/<str:tenant_id>/<str:child>", views.admin_tenants),
+    path("site", views.admin_site),
+    path("site/", views.admin_site),
+    path("users", views.admin_users),
+    path("users/", views.admin_users),
+    path("users/<str:tenant_id>/<str:customer_id>", views.admin_users),
+    path("users/<str:tenant_id>/<str:customer_id>/<str:action>", views.admin_users),
+]
 
 urlpatterns = [
     path("health", views.health),
@@ -55,27 +82,5 @@ urlpatterns = [
     path("tickets/<str:ticket_id>", views.tickets),
     path("paystack/webhook", views.paystack_webhook),
     path("paystack/callback", views.paystack_callback),
-    path("admin/auth/login", views.admin_login),
-    path("admin/tenants", views.admin_tenants),
-    path("admin/tenants/", views.admin_tenants),
-    path("admin/tenants/stats/summary", views.admin_stats),
-    path("admin/system/stats", views.admin_system_stats),
-    path("admin/system", views.admin_system),
-    path("admin/system/migrations", views.admin_system_migrations),
-    path("admin/subscriptions", views.admin_subscriptions),
-    path("admin/subscriptions/revenue-chart", views.admin_revenue_chart),
-    path("admin/subscriptions/<int:subscription_id>", views.admin_subscriptions),
-    path("admin/subscriptions/<int:subscription_id>/payments", views.admin_subscription_payments),
-    path("admin/tenants/<str:tenant_id>/subscription", views.admin_tenant_subscription),
-    path("admin/tenants/<str:tenant_id>/subscription/remind", views.admin_subscription_remind),
-    path("admin/tenants/<str:tenant_id>/mikrotik/test", views.admin_mikrotik_test),
-    path("admin/tenants/audit/logs", views.admin_audit_logs),
-    path("admin/tenants/<str:tenant_id>", views.admin_tenants),
-    path("admin/tenants/<str:tenant_id>/<str:child>", views.admin_tenants),
-    path("admin/site", views.admin_site),
-    path("admin/site/", views.admin_site),
-    path("admin/users", views.admin_users),
-    path("admin/users/", views.admin_users),
-    path("admin/users/<str:tenant_id>/<str:customer_id>", views.admin_users),
-    path("admin/users/<str:tenant_id>/<str:customer_id>/<str:action>", views.admin_users),
+    path(f"{settings.ADMIN_API_PATH}/", include(admin_urlpatterns)),
 ]

@@ -13,3 +13,4 @@ redis==5.2.1
 celery[redis]==5.4.0
 gevent==24.11.1
 whitenoise==6.8.2
+gunicorn==23.0.0

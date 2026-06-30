@@ -15,6 +15,7 @@ import { useEffect, useMemo, useState } from 'react';
 import toast from 'react-hot-toast';
 import { Link } from 'react-router-dom';
 import adminApi from '../../api/adminAxios';
+import { adminPath } from '../../config/adminPaths';
 
 function formatKES(value) {
   return `KES ${Number(value || 0).toLocaleString()}`;
@@ -150,7 +151,7 @@ function SubscriptionOverview({ stats }) {
           ))}
         </div>
       </div>
-      <Link to="/admin/subscriptions" className="mt-6 flex h-10 items-center justify-center rounded-md border border-[#118cf0] text-[12px] font-bold text-[#118cf0] hover:bg-blue-50">
+      <Link to={adminPath('subscriptions')} className="mt-6 flex h-10 items-center justify-center rounded-md border border-[#118cf0] text-[12px] font-bold text-[#118cf0] hover:bg-blue-50">
         View All Subscriptions
       </Link>
     </section>
@@ -269,7 +270,7 @@ export default function AdminDashboard() {
               </tbody>
             </table>
           </div>
-          <Link to="/admin/tenants" className="flex items-center gap-3 px-6 py-5 text-[12px] font-extrabold text-[#118cf0]">
+          <Link to={adminPath('tenants')} className="flex items-center gap-3 px-6 py-5 text-[12px] font-extrabold text-[#118cf0]">
             View all tenants <ArrowRight size={15} />
           </Link>
         </section>
@@ -297,7 +298,7 @@ export default function AdminDashboard() {
               );
             })}
           </div>
-          <Link to="/admin/audit" className="flex items-center gap-3 px-6 py-5 text-[12px] font-extrabold text-[#118cf0]">
+          <Link to={adminPath('audit')} className="flex items-center gap-3 px-6 py-5 text-[12px] font-extrabold text-[#118cf0]">
             View all activities <ArrowRight size={15} />
           </Link>
         </section>

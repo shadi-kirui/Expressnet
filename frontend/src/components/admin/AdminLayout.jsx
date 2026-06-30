@@ -23,22 +23,23 @@ import {
 import { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAdminAuth } from '../../context/AdminAuthContext';
+import { ADMIN_LOGIN_PATH, adminPath } from '../../config/adminPaths';
 
 const links = [
-  { to: '/admin/dashboard', label: 'Dashboard', icon: Home },
-  { to: '/admin/tenants', label: 'Tenants', icon: Users },
-  { to: '/admin/subscriptions', label: 'Subscriptions', icon: CreditCard },
-  { to: '/admin/subscriptions', label: 'Invoices', icon: FileText },
-  { to: '/admin/subscriptions', label: 'Payments', icon: Receipt },
-  { to: '/admin/subscriptions', label: 'Plans & Pricing', icon: Tag },
-  { to: '/admin/users', label: 'Customers', icon: Building2 },
-  { to: '/admin/system', label: 'Reports', icon: LayoutDashboard },
-  { to: '/admin/system', label: 'Taxes', icon: ListChecks },
-  { to: '/admin/site', label: 'Settings', icon: Settings },
-  { to: '/admin/audit', label: 'Audit Logs', icon: Shield },
-  { to: '/admin/site', label: 'Integrations', icon: SlidersHorizontal },
-  { to: '/admin/users', label: 'Users & Roles', icon: UserCircle },
-  { to: '/admin/system', label: 'System Settings', icon: Settings },
+  { to: adminPath('dashboard'), label: 'Dashboard', icon: Home },
+  { to: adminPath('tenants'), label: 'Tenants', icon: Users },
+  { to: adminPath('subscriptions'), label: 'Subscriptions', icon: CreditCard },
+  { to: adminPath('subscriptions'), label: 'Invoices', icon: FileText },
+  { to: adminPath('subscriptions'), label: 'Payments', icon: Receipt },
+  { to: adminPath('subscriptions'), label: 'Plans & Pricing', icon: Tag },
+  { to: adminPath('users'), label: 'Customers', icon: Building2 },
+  { to: adminPath('system'), label: 'Reports', icon: LayoutDashboard },
+  { to: adminPath('system'), label: 'Taxes', icon: ListChecks },
+  { to: adminPath('site'), label: 'Settings', icon: Settings },
+  { to: adminPath('audit'), label: 'Audit Logs', icon: Shield },
+  { to: adminPath('site'), label: 'Integrations', icon: SlidersHorizontal },
+  { to: adminPath('users'), label: 'Users & Roles', icon: UserCircle },
+  { to: adminPath('system'), label: 'System Settings', icon: Settings },
 ];
 
 export default function AdminLayout() {
@@ -48,7 +49,7 @@ export default function AdminLayout() {
 
   const logout = () => {
     logoutAdmin();
-    navigate('/admin/login', { replace: true });
+    navigate(ADMIN_LOGIN_PATH, { replace: true });
   };
 
   const navClass = ({ isActive }) =>
