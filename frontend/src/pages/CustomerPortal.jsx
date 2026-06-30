@@ -5,7 +5,7 @@ import { useParams } from 'react-router-dom';
 import axios from 'axios';
 
 const publicApi = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'https://genco-production.up.railway.app/api',
+  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
 });
 
 function packageType(pkg) {
