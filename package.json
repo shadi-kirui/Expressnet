@@ -5,6 +5,7 @@
   "scripts": {
     "start": "python manage.py runserver 0.0.0.0:8000",
     "start:django": "python manage.py runserver 0.0.0.0:8000",
+    "db": "python manage.py dbconsole",
     "check": "python manage.py check",
     "build:frontend": "npm --prefix frontend run build",
     "build": "npm run build:frontend"
