@@ -6,19 +6,26 @@ from .base import *
 
 
 DEBUG = env_bool("DJANGO_DEBUG", False)
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "https://web-production-b9d86.up.railway.app/,localhost,127.0.0.1")
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+RAILWAY_ALLOWED_HOSTS = ["web-production-b9d86.up.railway.app", ".railway.app"]
+ALLOWED_HOSTS = sorted({*RAILWAY_ALLOWED_HOSTS, *env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")})
+CSRF_TRUSTED_ORIGINS = sorted(
+    {
+        "https://web-production-b9d86.up.railway.app",
+        *env_list("CSRF_TRUSTED_ORIGINS"),
+    }
+)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required in production.")
 
+database_ssl_default = "postgres.railway.internal" not in DATABASE_URL
 DATABASES = {
     "default": dj_database_url.config(
         default=DATABASE_URL,
         conn_max_age=600,
         conn_health_checks=True,
-        ssl_require=env_bool("DATABASE_SSL_REQUIRE", True),
+        ssl_require=env_bool("DATABASE_SSL_REQUIRE", database_ssl_default),
     )
 }
 
