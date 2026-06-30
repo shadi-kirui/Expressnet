@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +16,15 @@ import requests
 from firebase_admin import credentials, db as firebase_db
 
 from .models import AdminAuditLog, AdminUser, Customer, InternetPackage, Payment, SiteSettings, Tenant, Ticket
+
+logger = logging.getLogger(__name__)
+
+# Tracks lazy Firebase initialisation state:
+#   None  → not yet attempted
+#   True  → successfully initialised
+#   False → permanently failed / disabled (do not retry)
+_firebase_init_state = None
+_firebase_init_lock = threading.Lock()
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -50,36 +61,118 @@ def firebase_backup_configured():
     return bool(os.getenv("FIREBASE_DATABASE_URL") and os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
 
 
-def init_firebase_backup():
-    if not firebase_backup_configured():
-        return False
-    if firebase_admin._apps:
-        return True
+def _do_firebase_initialize(service_account, database_url, result_holder):
+    """Run firebase_admin.initialize_app() in a worker thread so it can be timed out."""
+    try:
+        firebase_admin.initialize_app(
+            credentials.Certificate(service_account),
+            {"databaseURL": database_url},
+        )
+        result_holder["success"] = True
+    except Exception as exc:
+        result_holder["error"] = exc
 
-    if os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"):
-        service_account = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
-        if service_account.get("private_key"):
-            service_account["private_key"] = service_account["private_key"].replace("\\n", "\n")
-    else:
-        candidates = [BASE_DIR / "serviceAccount.json"]
-        candidates += list(BASE_DIR.glob("*firebase-adminsdk*.json"))
-        service_path = next((path for path in candidates if path.exists()), None)
-        if not service_path:
+
+def init_firebase_backup(timeout=10):
+    """Initialise Firebase lazily and non-blockingly.
+
+    Returns True if Firebase is ready, False otherwise.  The result is cached
+    so subsequent calls are instant.  A configurable *timeout* (seconds)
+    prevents the worker from hanging when credentials are invalid or the
+    network is unreachable.
+    """
+    global _firebase_init_state
+
+    # Fast path — already resolved (True or False).
+    if _firebase_init_state is not None:
+        return _firebase_init_state
+
+    with _firebase_init_lock:
+        # Re-check inside the lock in case another thread just resolved it.
+        if _firebase_init_state is not None:
+            return _firebase_init_state
+
+        if not firebase_backup_configured():
+            _firebase_init_state = False
             return False
-        service_account = json.loads(service_path.read_text(encoding="utf-8"))
 
-    database_url = os.getenv("FIREBASE_DATABASE_URL", "").strip().strip("\"'").rstrip(" ,/\t\r\n")
-    if not database_url:
+        # If the app was already initialised outside this function, accept it.
+        if firebase_admin._apps:
+            _firebase_init_state = True
+            return True
+
+        # Build credentials from env or file.
+        try:
+            if os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"):
+                service_account = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
+                if service_account.get("private_key"):
+                    service_account["private_key"] = service_account["private_key"].replace("\\n", "\n")
+            else:
+                candidates = [BASE_DIR / "serviceAccount.json"]
+                candidates += list(BASE_DIR.glob("*firebase-adminsdk*.json"))
+                service_path = next((path for path in candidates if path.exists()), None)
+                if not service_path:
+                    logger.warning("Firebase backup: no service account credentials found; skipping.")
+                    _firebase_init_state = False
+                    return False
+                service_account = json.loads(service_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Firebase backup: failed to load credentials: %s", exc)
+            _firebase_init_state = False
+            return False
+
+        database_url = os.getenv("FIREBASE_DATABASE_URL", "").strip().strip("\"'").rstrip(" ,/\t\r\n")
+        if not database_url:
+            logger.warning("Firebase backup: FIREBASE_DATABASE_URL is empty; skipping.")
+            _firebase_init_state = False
+            return False
+
+        # Run initialize_app() in a daemon thread with a timeout so a slow or
+        # unreachable Firebase endpoint cannot block the Celery worker startup.
+        result_holder: dict = {"success": False, "error": None}
+        init_thread = threading.Thread(
+            target=_do_firebase_initialize,
+            args=(service_account, database_url, result_holder),
+            daemon=True,
+        )
+        init_thread.start()
+        init_thread.join(timeout=timeout)
+
+        if init_thread.is_alive():
+            # Thread is still blocked — Firebase is unreachable or very slow.
+            logger.error(
+                "Firebase backup: initialize_app() did not complete within %s seconds; "
+                "Firebase backup will be disabled for this process.",
+                timeout,
+            )
+            _firebase_init_state = False
+            return False
+
+        if result_holder.get("error"):
+            logger.error("Firebase backup: initialization failed: %s", result_holder["error"])
+            _firebase_init_state = False
+            return False
+
+        if result_holder["success"]:
+            logger.info("Firebase backup: initialized successfully.")
+            _firebase_init_state = True
+            return True
+
+        # Unexpected — thread finished but neither success nor error was set.
+        logger.warning("Firebase backup: initialization produced no result; skipping.")
+        _firebase_init_state = False
         return False
-
-    firebase_admin.initialize_app(credentials.Certificate(service_account), {"databaseURL": database_url})
-    return True
 
 
 def firebase_backup_ref(path):
-    if not init_firebase_backup():
+    """Return a Firebase DB reference for *path*, or None if Firebase is unavailable."""
+    try:
+        if not init_firebase_backup():
+            return None
+        return firebase_db.reference(path)
+    except Exception as exc:
+        logger.warning("Firebase backup: could not get reference for '%s': %s", path, exc)
         return None
-    return firebase_db.reference(path)
 
 
 def backup_set(path, data):
