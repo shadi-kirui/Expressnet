@@ -1,0 +1,221 @@
+diff --git a/billing_api/urls.py b/billing_api/urls.py
+index bad184d..54d36ed 100644
+--- a/billing_api/urls.py
++++ b/billing_api/urls.py
+@@ -60,6 +60,8 @@ urlpatterns = [
+     path("router/provision/<str:token>", views.router_provision_script),
+     path("router/provision/<str:token>/complete", views.router_provision_complete),
+     path("router/provision/<str:token>/snapshot/<str:section>", views.router_provision_snapshot),
++    path("router/agent/<str:token>/poll", views.router_agent_poll),
++    path("router/agent/<str:token>/ack/<str:command_id>", views.router_agent_ack),
+     path("packages/sync-all", views.package_sync),
+     path("packages/<str:package_id>", views.packages),
+     path("packages/<str:package_id>/sync", views.package_sync),
+diff --git a/billing_api/views.py b/billing_api/views.py
+index a0afea7..054364a 100644
+--- a/billing_api/views.py
++++ b/billing_api/views.py
+@@ -1006,13 +1006,75 @@ def router_ports(request):
+             "profile": result.get("profile") or profile_name,
+             "portal_url": result.get("portal_url"),
+             "updated_at": iso_now(),
++            "status": "applied",
+         }
+         ref(f"tenants/{request.tenant['id']}").update({"router_port_assignments": assignments})
+         return ok({"success": True, "message": f"{interface_name} assigned to {service_type.upper()}", "result": result, "assignments": assignments})
++    except (TimeoutError, OSError):
++        # Router isn't directly reachable (typical when it's behind
++        # NAT/CGNAT and no port-forward/tunnel exists for the RouterOS API
++        # port). Queue the change instead — the router's own scheduler
++        # polls for pending commands and applies them on its own outbound
++        # connection, same as provisioning does.
++        return _queue_router_port_command(request, interface_name, service_type, profile_name)
+     except Exception as exc:
+         return ok({"message": f"Unable to assign router port: {exc}"}, 400)
+ 
+ 
++def _build_port_command_script(interface_name, service_type, profile_name, portal_url):
++    if service_type == "pppoe":
++        return (
++            f':do {{ /interface set [find name="{interface_name}"] comment="billing-saas:pppoe:profile={profile_name}" }} on-error={{}}; '
++            f':local billingSvc [/interface pppoe-server server find interface="{interface_name}"]; '
++            f':if ([:len $billingSvc] > 0) do={{ /interface pppoe-server server set $billingSvc service-name="billing-{interface_name}" default-profile="{profile_name}" one-session-per-host=yes disabled=no }} else={{ /interface pppoe-server server add service-name="billing-{interface_name}" interface="{interface_name}" default-profile="{profile_name}" one-session-per-host=yes disabled=no }};'
++        )
++    portal_comment = portal_url or ""
++    return (
++        f':do {{ /interface set [find name="{interface_name}"] comment="billing-saas:hotspot:portal={portal_comment}" }} on-error={{}}; '
++        f':local billingHs [/ip hotspot find interface="{interface_name}"]; '
++        f':if ([:len $billingHs] > 0) do={{ /ip hotspot set $billingHs name="billing-hotspot-{interface_name}" profile="billing-saas-captive" disabled=no comment="billing-saas captive portal: {portal_comment}" }} else={{ /ip hotspot add name="billing-hotspot-{interface_name}" interface="{interface_name}" profile="billing-saas-captive" disabled=no comment="billing-saas captive portal: {portal_comment}" }};'
++    )
++
++
++def _queue_router_port_command(request, interface_name, service_type, profile_name):
++    if service_type not in {"pppoe", "hotspot"}:
++        return ok({"message": "Port service must be either pppoe or hotspot"}, 400)
++
++    tenant_id = request.tenant["id"]
++    portal_url = f"{public_base_url(request).rstrip('/')}/portal/{tenant_id}" if service_type == "hotspot" else None
++    script = _build_port_command_script(interface_name, service_type, profile_name, portal_url)
++
++    commands = [c for c in (request.tenant.get("pending_router_commands") or []) if c.get("status") == "pending"][-19:]
++    commands.append({
++        "id": secrets.token_hex(8),
++        "interface": interface_name,
++        "service_type": service_type,
++        "profile": profile_name,
++        "portal_url": portal_url,
++        "script": script,
++        "status": "pending",
++        "created_at": iso_now(),
++    })
++    ref(f"tenants/{tenant_id}").update({"pending_router_commands": commands})
++
++    assignments = dict(request.tenant.get("router_port_assignments") or {})
++    assignments[interface_name] = {
++        "service_type": service_type,
++        "profile": profile_name,
++        "portal_url": portal_url,
++        "updated_at": iso_now(),
++        "status": "queued",
++    }
++    ref(f"tenants/{tenant_id}").update({"router_port_assignments": assignments})
++
++    return ok({
++        "success": True,
++        "queued": True,
++        "message": f"Router isn't directly reachable, so {interface_name} has been queued and will be applied automatically the next time the router checks in (usually within 30s).",
++        "assignments": assignments,
++    })
++
++
+ @csrf_exempt
+ @api_view(["GET"])
+ @tenant_required
+@@ -1030,15 +1092,13 @@ def router_provision_command(request):
+     })
+     script_url = f"{public_base_url(request)}/api/router/provision/{token}"
+     callback_url = f"{public_base_url(request)}/api/router/provision/{token}/complete"
+-    snapshot_url = f"{public_base_url(request)}/api/router/provision/{token}/snapshot"
+-    snapshot_steps = (
+-        f' :local billingSnapshot "{snapshot_url}"; '
+-        '/tool fetch url=($billingSnapshot . "/marker") keep-result=no; '
+-        ':foreach i in=[/interface find] do={ /tool fetch url=($billingSnapshot . "/interface?name=" . [/interface get $i name] . "&type=" . [/interface get $i type] . "&running=" . [/interface get $i running] . "&disabled=" . [/interface get $i disabled]) keep-result=no; }; '
+-        ':foreach p in=[/ppp profile find] do={ /tool fetch url=($billingSnapshot . "/pppoe-profile?name=" . [/ppp profile get $p name]) keep-result=no; }; '
+-        ':foreach p in=[/ip hotspot user profile find] do={ /tool fetch url=($billingSnapshot . "/hotspot-profile?name=" . [/ip hotspot user profile get $p name]) keep-result=no; };'
+-    )
+-    command = f'/tool fetch url="{script_url}" dst-path=billing-saas.rsc; delay 2s; /import billing-saas.rsc; delay 1s;{snapshot_steps} delay 1s; /tool fetch url="{callback_url}" keep-result=no;'
++    # NOTE: the imported .rsc script (router_provision_script) already performs
++    # the full device/interface/profile snapshot AND calls the /complete
++    # callback internally. Do not duplicate that work here — doing so doubles
++    # the number of sequential HTTPS/TLS handshakes the router has to make,
++    # which is enough to exhaust RouterOS's SSL session pool on low-resource
++    # hardware (RB9xx-class devices) and surfaces as "SSL: internal error (6)".
++    command = f'/tool fetch url="{script_url}" dst-path=billing-saas.rsc; delay 2s; /import billing-saas.rsc;'
+     return ok({
+         "command": command,
+         "script_url": script_url,
+@@ -1101,6 +1161,14 @@ def router_provision_script(request, token):
+     callback_url = f"{base_url}/api/router/provision/{token}/complete"
+     snapshot_url = f"{base_url}/api/router/provision/{token}/snapshot"
+     login_html = f"<!doctype html><html><head><meta http-equiv='refresh' content='0; url={portal_url}'></head><body><script>location.replace('{portal_url}');</script></body></html>"
++    # Long-lived token identifying this router/tenant for the command-poll
++    # agent. Unlike the 15-minute provisioning token, this one has no
++    # expiry — it's the router's standing "phone home" credential, used so
++    # the backend can push config changes (e.g. port assignments) to routers
++    # that sit behind NAT/CGNAT without needing any inbound connection to
++    # the router's API port.
++    agent_token = jwt.encode({"purpose": "mikrotik_agent", "tenant_id": tenant_id}, _get_jwt_secret("JWT_SECRET"), algorithm="HS256")
++    agent_poll_url = f"{base_url}/api/router/agent/{agent_token}/poll"
+     script = f""":log info "Billing SaaS provisioning started";
+ /ip service enable api;
+ :do {{ /ip service set api disabled=no }} on-error={{}}
+@@ -1121,6 +1189,8 @@ def router_provision_script(request, token):
+ :foreach s in=[/interface pppoe-server server find] do={{ :do {{ /tool fetch keep-result=no url=($billingSnapshot . "/pppoe-server?name=" . [/interface pppoe-server server get $s service-name] . "&interface=" . [/interface pppoe-server server get $s interface] . "&default_profile=" . [/interface pppoe-server server get $s default-profile] . "&disabled=" . [/interface pppoe-server server get $s disabled]) }} on-error={{}} }}
+ :foreach h in=[/ip hotspot find] do={{ :do {{ /tool fetch keep-result=no url=($billingSnapshot . "/hotspot-server?name=" . [/ip hotspot get $h name] . "&interface=" . [/ip hotspot get $h interface] . "&profile=" . [/ip hotspot get $h profile] . "&disabled=" . [/ip hotspot get $h disabled]) }} on-error={{}} }}
+ :do {{ /tool fetch keep-result=no url="{callback_url}" }} on-error={{ :log warning "Billing SaaS provisioning callback failed" }}
++:do {{ /system scheduler remove [find name="billing-saas-agent"] }} on-error={{}}
++/system scheduler add name="billing-saas-agent" interval=30s on-event=":do {{ /tool fetch url=\\"{agent_poll_url}\\" dst-path=billing-saas-cmd.rsc keep-result=no }} on-error={{}}; :do {{ /import billing-saas-cmd.rsc }} on-error={{}};"
+ :log info "Billing SaaS provisioning complete";
+ """
+     return HttpResponse(script, content_type="text/plain")
+@@ -1212,6 +1282,80 @@ def router_provision_snapshot(request, token, section):
+     return ok({"success": True})
+ 
+ 
++def _decode_agent_token(token):
++    payload = jwt.decode(token, _get_jwt_secret("JWT_SECRET"), algorithms=["HS256"])
++    if payload.get("purpose") != "mikrotik_agent":
++        raise ValueError("Invalid agent token")
++    return str(payload.get("tenant_id") or "")
++
++
++@csrf_exempt
++@api_view(["GET"])
++def router_agent_poll(request, token):
++    """Polled every 30s by the router's own scheduler (set up during
++    provisioning). Returns a RouterOS script for the oldest pending command,
++    if any, so config changes reach the router without needing any inbound
++    connection to it."""
++    try:
++        tenant_id = _decode_agent_token(token)
++    except Exception:
++        return HttpResponse(':log warning "Billing SaaS: invalid agent token";\n', status=401, content_type="text/plain")
++
++    tenant = Tenant.objects.filter(pk=tenant_id).first()
++    if not tenant:
++        return HttpResponse(':log warning "Billing SaaS: tenant not found";\n', status=404, content_type="text/plain")
++
++    client_ip = (
++        request.META.get("HTTP_NGROK_AGENT_IPS")
++        or request.META.get("HTTP_X_FORWARDED_FOR")
++        or request.META.get("REMOTE_ADDR")
++        or ""
++    ).split(",")[0].strip()
++    ref(f"tenants/{tenant_id}").update({"mikrotik_last_seen_at": iso_now(), "mikrotik_last_seen_ip": client_ip})
++
++    commands = list((tenant.extra or {}).get("pending_router_commands") or [])
++    pending = next((c for c in commands if c.get("status") == "pending"), None)
++    if not pending:
++        return HttpResponse(':log info "Billing SaaS: no pending commands";\n', content_type="text/plain")
++
++    base_url = public_base_url(request).rstrip("/")
++    ack_url = f"{base_url}/api/router/agent/{token}/ack/{pending['id']}"
++    body_script = pending.get("script") or ""
++    script = f'{body_script} :do {{ /tool fetch url="{ack_url}" keep-result=no }} on-error={{}};\n'
++    return HttpResponse(script, content_type="text/plain")
++
++
++@csrf_exempt
++@api_view(["GET"])
++def router_agent_ack(request, token, command_id):
++    try:
++        tenant_id = _decode_agent_token(token)
++    except Exception:
++        return ok({"message": "Invalid agent token"}, 401)
++
++    tenant = Tenant.objects.filter(pk=tenant_id).first()
++    if not tenant:
++        return ok({"message": "Tenant not found"}, 404)
++
++    commands = list((tenant.extra or {}).get("pending_router_commands") or [])
++    for cmd in commands:
++        if cmd.get("id") == command_id:
++            cmd["status"] = "applied"
++            cmd["applied_at"] = iso_now()
++
++    assignments = dict(tenant.extra.get("router_port_assignments") or {}) if tenant.extra else {}
++    applied = next((c for c in commands if c.get("id") == command_id), None)
++    if applied and applied.get("interface") in assignments:
++        assignments[applied["interface"]]["status"] = "applied"
++
++    ref(f"tenants/{tenant_id}").update({
++        "pending_router_commands": commands,
++        "router_port_assignments": assignments,
++        "mikrotik_last_seen_at": iso_now(),
++    })
++    return ok({"success": True})
++
++
+ @csrf_exempt
+ @api_view(["POST"])
+ @tenant_required

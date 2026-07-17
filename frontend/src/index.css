@@ -1,0 +1,149 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --dashboard-color: #fa8200;
+    --dashboard-color-soft: #ffd1a0;
+    --app-bg: #ffffff;
+    --app-panel: #ffffff;
+    --app-panel-muted: #f8fafc;
+    --app-border: #e2e8f0;
+    --app-text: #0f172a;
+    --app-muted: #64748b;
+    --app-input: #ffffff;
+    --app-input-text: #0f172a;
+  }
+
+  html[data-theme="dark"] {
+    --app-bg: #111318;
+    --app-panel: #1f2127;
+    --app-panel-muted: #2a2d35;
+    --app-border: #343946;
+    --app-text: #f8fafc;
+    --app-muted: #aeb7c8;
+    --app-input: #2a2d35;
+    --app-input-text: #f8fafc;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background: var(--app-bg);
+    color: var(--app-text);
+    font-family: Roboto, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex h-8 items-center justify-center gap-2 rounded-md bg-app-navy px-3 text-xs font-normal text-white transition hover:bg-app-navySoft disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .btn-danger {
+    @apply inline-flex h-8 items-center justify-center gap-2 rounded-md bg-app-navy px-3 text-xs font-normal text-white transition hover:bg-app-navySoft disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .btn-secondary {
+    @apply inline-flex h-8 items-center justify-center gap-2 rounded-md border border-app-navy px-3 text-xs font-normal text-app-navy transition disabled:cursor-not-allowed disabled:opacity-60;
+    background: var(--app-panel);
+  }
+
+  .form-label {
+    @apply block text-[10px] font-normal uppercase tracking-wide text-slate-500;
+  }
+
+  .form-input {
+    @apply mt-1 h-8 w-full rounded-md border px-3 text-xs outline-none transition focus:border-app-navy focus:ring-2 focus:ring-blue-100;
+    background: var(--app-input);
+    border-color: var(--app-border);
+    color: var(--app-input-text);
+  }
+
+  .form-error {
+    @apply mt-1 text-xs font-normal text-red-600;
+  }
+
+  .table-shell {
+    @apply overflow-hidden rounded-lg border;
+    background: var(--app-panel);
+    border-color: var(--app-border);
+  }
+
+  .table-head {
+    @apply text-left text-[10px] font-normal uppercase tracking-wide;
+    background: var(--app-panel-muted);
+    color: var(--app-muted);
+  }
+
+  .table-cell {
+    @apply whitespace-nowrap px-4 py-3 text-xs font-normal;
+    color: var(--app-text);
+  }
+
+  .page-title {
+    @apply text-[20px] font-normal leading-7;
+    color: var(--app-text);
+  }
+
+  .page-subtitle {
+    @apply mt-1 max-w-2xl text-sm font-normal leading-5;
+    color: var(--app-muted);
+  }
+
+  .surface-card {
+    @apply rounded-lg border;
+    background: var(--app-panel);
+    border-color: var(--app-border);
+  }
+
+  .theme-page {
+    background: var(--app-bg);
+    color: var(--app-text);
+  }
+
+  .theme-card {
+    background: var(--app-panel);
+    border-color: var(--app-border);
+    color: var(--app-text);
+  }
+
+  .theme-card-muted {
+    background: var(--app-panel-muted);
+    border-color: var(--app-border);
+    color: var(--app-text);
+  }
+
+  .theme-text {
+    color: var(--app-text);
+  }
+
+  .theme-muted {
+    color: var(--app-muted);
+  }
+
+  .theme-input {
+    background: var(--app-input);
+    border-color: var(--app-border);
+    color: var(--app-input-text);
+  }
+
+  .theme-input::placeholder {
+    color: var(--app-muted);
+  }
+}

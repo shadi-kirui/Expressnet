@@ -1,0 +1,16 @@
+{
+  "name": "billing-saas",
+  "version": "1.0.0",
+  "description": "Django REST backend with a React frontend",
+  "scripts": {
+    "start": "python manage.py runserver 0.0.0.0:8000",
+    "start:django": "python manage.py runserver 0.0.0.0:8000",
+    "db": "python manage.py dbconsole",
+    "check": "python manage.py check",
+    "build:frontend": "npm --prefix frontend run build",
+    "build": "npm run build:frontend"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

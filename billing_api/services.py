@@ -1,0 +1,1433 @@
+import hashlib
+import hmac
+import json
+import os
+import socket
+import ssl
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import bcrypt
+import firebase_admin
+import jwt
+import requests
+from django.conf import settings
+from firebase_admin import credentials, db as firebase_db
+
+from .models import AdminAuditLog, AdminUser, Customer, InternetPackage, Payment, SiteSettings, Tenant, Ticket
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+class PaymentProviderError(RuntimeError):
+    def __init__(self, public_message, detail=None, status_code=502):
+        super().__init__(detail or public_message)
+        self.public_message = public_message
+        self.detail = detail or public_message
+        self.status_code = status_code
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utcnow().isoformat().replace("+00:00", "Z")
+
+
+def require_secret(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    if len(value) < 16:
+        raise RuntimeError(f"{name} must be at least 16 characters")
+    return value
+
+
+def firebase_backup_configured():
+    if os.getenv("FIREBASE_BACKUP_ENABLED", "true").lower() in {"0", "false", "no", "off"}:
+        return False
+    return bool(os.getenv("FIREBASE_DATABASE_URL") and os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
+
+
+def init_firebase_backup():
+    if not firebase_backup_configured():
+        return False
+    if firebase_admin._apps:
+        return True
+
+    if os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"):
+        service_account = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
+        if service_account.get("private_key"):
+            service_account["private_key"] = service_account["private_key"].replace("\\n", "\n")
+    else:
+        candidates = [BASE_DIR / "serviceAccount.json"]
+        candidates += list(BASE_DIR.glob("*firebase-adminsdk*.json"))
+        service_path = next((path for path in candidates if path.exists()), None)
+        if not service_path:
+            return False
+        service_account = json.loads(service_path.read_text(encoding="utf-8"))
+
+    database_url = os.getenv("FIREBASE_DATABASE_URL", "").strip().strip("\"'").rstrip(" ,/\t\r\n")
+    if not database_url:
+        return False
+
+    firebase_admin.initialize_app(credentials.Certificate(service_account), {"databaseURL": database_url})
+    return True
+
+
+def firebase_backup_ref(path):
+    if not init_firebase_backup():
+        return None
+    return firebase_db.reference(path)
+
+
+def backup_set(path, data):
+    backup = firebase_backup_ref(path)
+    if backup is not None:
+        backup.set(data)
+
+
+def backup_update(path, data):
+    backup = firebase_backup_ref(path)
+    if backup is not None:
+        backup.update(data)
+
+
+def backup_delete(path):
+    backup = firebase_backup_ref(path)
+    if backup is not None:
+        backup.delete()
+
+
+def model_dict(instance, include_id=True, exclude=None):
+    return instance.as_dict(include_id=include_id, exclude=exclude) if hasattr(instance, "as_dict") else {}
+
+
+def model_update(instance, data):
+    instance.apply_data(data)
+    instance.save()
+    return instance
+
+
+class OrmRef:
+    def __init__(self, path=""):
+        self.parts = [part for part in str(path).strip("/").split("/") if part]
+        self.key = None
+
+    def _tenant(self, tenant_id):
+        return Tenant.objects.get(pk=tenant_id)
+
+    def _package(self, tenant_id, package_id):
+        return InternetPackage.objects.get(tenant_id=tenant_id, pk=package_id)
+
+    def _customer(self, tenant_id, customer_id):
+        return Customer.objects.get(tenant_id=tenant_id, pk=customer_id)
+
+    def _payment(self, tenant_id, payment_id):
+        return Payment.objects.get(tenant_id=tenant_id, pk=payment_id)
+
+    def _ticket(self, tenant_id, ticket_id):
+        return Ticket.objects.get(tenant_id=tenant_id, pk=ticket_id)
+
+    def _site_settings(self):
+        return SiteSettings.objects.order_by("pk").first()
+
+    def _resolve_instance(self):
+        parts = self.parts
+        if len(parts) == 2 and parts[0] == "tenants":
+            return self._tenant(parts[1])
+        if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "packages":
+            return self._package(parts[1], parts[3])
+        if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "customers":
+            return self._customer(parts[1], parts[3])
+        if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "payments":
+            return self._payment(parts[1], parts[3])
+        if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "tickets":
+            return self._ticket(parts[1], parts[3])
+        if len(parts) == 2 and parts[0] == "admins":
+            return AdminUser.objects.get(pk=parts[1])
+        if parts == ["site_settings"]:
+            return self._site_settings()
+        raise KeyError(f"Unsupported relational ref path: {'/'.join(parts)}")
+
+    def get(self):
+        parts = self.parts
+        try:
+            if parts == ["tenants"]:
+                return {str(item.pk): model_dict(item, include_id=False) for item in Tenant.objects.all()}
+            if len(parts) == 2 and parts[0] == "tenants":
+                return model_dict(self._tenant(parts[1]), include_id=False)
+            if len(parts) == 3 and parts[0] == "tenants" and parts[2] == "packages":
+                return {str(item.pk): model_dict(item, include_id=False) for item in InternetPackage.objects.filter(tenant_id=parts[1])}
+            if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "packages":
+                return model_dict(self._package(parts[1], parts[3]), include_id=False)
+            if len(parts) == 3 and parts[0] == "tenants" and parts[2] == "customers":
+                return {str(item.pk): model_dict(item, include_id=False, exclude={"password"}) for item in Customer.objects.filter(tenant_id=parts[1])}
+            if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "customers":
+                return model_dict(self._customer(parts[1], parts[3]), include_id=False)
+            if len(parts) == 3 and parts[0] == "tenants" and parts[2] == "payments":
+                return {str(item.pk): model_dict(item, include_id=False) for item in Payment.objects.filter(tenant_id=parts[1])}
+            if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "payments":
+                return model_dict(self._payment(parts[1], parts[3]), include_id=False)
+            if len(parts) == 3 and parts[0] == "tenants" and parts[2] == "tickets":
+                return {str(item.pk): model_dict(item, include_id=False) for item in Ticket.objects.filter(tenant_id=parts[1])}
+            if len(parts) == 4 and parts[0] == "tenants" and parts[2] == "tickets":
+                return model_dict(self._ticket(parts[1], parts[3]), include_id=False)
+            if parts == ["admins"]:
+                return {str(item.pk): model_dict(item, include_id=False) for item in AdminUser.objects.all()}
+            if len(parts) == 2 and parts[0] == "admins":
+                return model_dict(AdminUser.objects.get(pk=parts[1]), include_id=False)
+            if parts == ["site_settings"]:
+                settings = self._site_settings()
+                return model_dict(settings, include_id=False) if settings else {}
+            if parts == ["admin_audit_logs"]:
+                return {str(item.pk): item.as_dict(include_id=False) for item in AdminAuditLog.objects.all()}
+        except (Tenant.DoesNotExist, InternetPackage.DoesNotExist, Customer.DoesNotExist, Payment.DoesNotExist, Ticket.DoesNotExist, AdminUser.DoesNotExist):
+            return None
+        raise KeyError(f"Unsupported relational ref path: {'/'.join(parts)}")
+
+    def push(self, data):
+        parts = self.parts
+        if parts == ["tenants"]:
+            instance = Tenant()
+        elif len(parts) == 3 and parts[0] == "tenants" and parts[2] == "packages":
+            instance = InternetPackage(tenant_id=parts[1])
+        elif len(parts) == 3 and parts[0] == "tenants" and parts[2] == "customers":
+            instance = Customer(tenant_id=parts[1])
+        elif len(parts) == 3 and parts[0] == "tenants" and parts[2] == "payments":
+            instance = Payment(tenant_id=parts[1])
+        elif len(parts) == 3 and parts[0] == "tenants" and parts[2] == "tickets":
+            instance = Ticket(tenant_id=parts[1])
+        elif parts == ["admins"]:
+            instance = AdminUser()
+        elif parts == ["admin_audit_logs"]:
+            instance = AdminAuditLog()
+        else:
+            raise KeyError(f"Unsupported relational push path: {'/'.join(parts)}")
+
+        if hasattr(instance, "apply_data"):
+            instance.apply_data(dict(data or {}))
+        else:
+            for key, value in (data or {}).items():
+                if hasattr(instance, key):
+                    setattr(instance, key, value)
+        instance.save()
+        result = OrmPushResult(instance, self._child_backup_path(instance))
+        result.backup_set()
+        return result
+
+    def update(self, data):
+        parts = self.parts
+        if parts == ["site_settings"]:
+            instance = self._site_settings() or SiteSettings()
+            model_update(instance, dict(data or {}))
+            backup_update("site_settings", dict(data or {}))
+            return
+        instance = self._resolve_instance()
+        if not instance:
+            return
+        model_update(instance, dict(data or {}))
+        backup_update(self._backup_path(), dict(data or {}))
+
+    def delete(self):
+        instance = self._resolve_instance()
+        if instance:
+            instance.delete()
+            backup_delete(self._backup_path())
+
+    def _backup_path(self):
+        return "/".join(self.parts)
+
+    def _child_backup_path(self, instance):
+        parts = list(self.parts)
+        if parts == ["tenants"]:
+            return f"tenants/{instance.pk}"
+        if len(parts) == 3 and parts[0] == "tenants" and parts[2] in {"packages", "customers", "payments", "tickets"}:
+            return f"{'/'.join(parts)}/{instance.pk}"
+        if parts == ["admins"]:
+            return f"admins/{instance.pk}"
+        if parts == ["admin_audit_logs"]:
+            return f"admin_audit_logs/{instance.pk}"
+        return f"{'/'.join(parts)}/{instance.pk}"
+
+
+class OrmPushResult:
+    def __init__(self, instance, backup_path):
+        self.instance = instance
+        self.key = str(instance.pk)
+        self.backup_path = backup_path
+
+    def update(self, data):
+        model_update(self.instance, dict(data or {}))
+        backup_update(self.backup_path, dict(data or {}))
+
+    def backup_set(self):
+        if hasattr(self.instance, "as_dict"):
+            backup_set(self.backup_path, self.instance.as_dict(include_id=False))
+        else:
+            backup_set(self.backup_path, {})
+
+
+def ref(path=""):
+    return OrmRef(path)
+
+
+def list_children(path):
+    value = ref(path).get() or {}
+    if not isinstance(value, dict):
+        return []
+    return [{"id": key, **(item or {})} for key, item in value.items()]
+
+
+def find_child_by_field(path, field, expected):
+    expected = str(expected).lower().strip()
+    for item in list_children(path):
+        if str(item.get(field, "")).lower().strip() == expected:
+            return item
+    return None
+
+
+def hash_password(password):
+    return bcrypt.hashpw(str(password).encode(), bcrypt.gensalt(rounds=10)).decode()
+
+
+def check_password(password, hashed):
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(str(password).encode(), str(hashed).encode())
+    except (ValueError, TypeError):
+        return False
+
+
+def _get_jwt_secret(name):
+    value = os.getenv(name, "")
+    if not value:
+        raise RuntimeError(f"{name} is not configured. Please set it in your .env file.")
+    return value
+
+
+def tenant_token(tenant_id):
+    return jwt.encode(
+        {"id": tenant_id, "exp": utcnow() + timedelta(days=7)},
+        _get_jwt_secret("JWT_SECRET"),
+        algorithm="HS256",
+    )
+
+
+def admin_token(admin_id, admin_data):
+    return jwt.encode(
+        {
+            "adminId": admin_id,
+            "email": admin_data.get("email"),
+            "name": admin_data.get("name"),
+            "role": "admin",
+            "exp": utcnow() + timedelta(hours=4),
+        },
+        _get_jwt_secret("ADMIN_JWT_SECRET"),
+        algorithm="HS256",
+    )
+
+
+def decode_tenant_token(token):
+    return jwt.decode(token, _get_jwt_secret("JWT_SECRET"), algorithms=["HS256"])
+
+
+def decode_admin_token(token):
+    return jwt.decode(token, _get_jwt_secret("ADMIN_JWT_SECRET"), algorithms=["HS256"])
+
+
+def normalize_phone(phone):
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits.startswith("254") and len(digits) == 12:
+        return digits
+    if digits.startswith("0") and len(digits) == 10:
+        return f"254{digits[1:]}"
+    if digits.startswith("7") and len(digits) == 9:
+        return f"254{digits}"
+    return digits
+
+
+def get_public_base_url():
+    candidates = [
+        os.getenv("PUBLIC_APP_URL"),
+        os.getenv("PAYSTACK_CALLBACK_BASE_URL"),
+        getattr(settings, "PUBLIC_APP_URL", ""),
+        getattr(settings, "PAYSTACK_CALLBACK_BASE_URL", ""),
+    ]
+    if not settings.DEBUG:
+        candidates = [item for item in candidates if item and "localhost" not in item and "127.0.0.1" not in item]
+    configured = next((item for item in candidates if item), "")
+    return (configured or "").rstrip("/")
+
+
+def get_platform_paystack_secret():
+    secret = os.getenv("PAYSTACK_SECRET_KEY")
+    if secret and "replace_with" not in secret and not secret.strip().endswith("_secret_key"):
+        return secret.strip()
+    raise PaymentProviderError(
+        "Payment is temporarily unavailable. Please contact support.",
+        "PAYSTACK_SECRET_KEY is not configured",
+        503,
+    )
+
+
+def get_paystack_secret(tenant=None):
+    tenant_secret = (tenant or {}).get("paystack_secret_key")
+    if tenant_secret and str(tenant_secret).strip() and "â€¢" not in str(tenant_secret) and "replace_with" not in str(tenant_secret):
+        return str(tenant_secret).strip()
+    return get_platform_paystack_secret()
+
+
+def make_paystack_reference(tenant_id):
+    return f"ps_{tenant_id}_{uuid.uuid4().hex[:24]}"
+
+
+def paystack_amount(amount):
+    return int(round(float(amount or 0) * 100))
+
+
+def paystack_platform_percentage():
+    try:
+        return float(os.getenv("PAYSTACK_PLATFORM_PERCENTAGE", "1"))
+    except ValueError:
+        return 1.0
+
+
+def create_paystack_subaccount(tenant, bank_code, account_number, business_number=None, percentage_charge=None):
+    secret = get_platform_paystack_secret()
+    payload = {
+        "business_name": tenant.get("business_name") or tenant.get("email") or "Internet tenant",
+        "bank_code": str(bank_code or "").strip(),
+        "account_number": str(account_number or "").strip(),
+        "percentage_charge": paystack_platform_percentage() if percentage_charge is None else float(percentage_charge),
+        "description": f"ISP tenant settlement account for {tenant.get('business_name') or tenant.get('id')}",
+        "primary_contact_name": tenant.get("owner_name") or tenant.get("business_name") or "",
+        "primary_contact_email": tenant.get("email") or "",
+        "primary_contact_phone": tenant.get("phone") or "",
+    }
+    if business_number:
+        payload["metadata"] = {"business_number": business_number}
+
+    if not payload["bank_code"] or not payload["account_number"]:
+        raise PaymentProviderError("Bank code and account number are required to create a settlement account.", "Missing bank_code or account_number", 400)
+
+    response = requests.post(
+        "https://api.paystack.co/subaccount",
+        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise PaymentProviderError(
+            "Could not create the tenant settlement account. Please verify the bank details.",
+            f"Paystack subaccount creation failed {response.status_code}: {response.text[:500]}",
+            502 if response.status_code not in {401, 403} else 503,
+        ) from exc
+    data = response.json()
+    if not data.get("status"):
+        raise PaymentProviderError("Could not create the tenant settlement account. Please verify the bank details.", data.get("message") or "Paystack rejected subaccount creation", 502)
+    return data.get("data") or {}
+
+
+def initiate_paystack_payment(tenant, payment_id, amount, email=None, phone=None, description=None, metadata=None):
+    secret = get_platform_paystack_secret()
+    subaccount_code = str((tenant or {}).get("paystack_subaccount_code") or "").strip()
+    if not subaccount_code:
+        raise PaymentProviderError(
+            "Payment is not ready for this business. Please contact support.",
+            "Tenant has no Paystack subaccount code",
+            503,
+        )
+    reference = make_paystack_reference(tenant.get("id"))
+    base_url = get_public_base_url()
+    if not base_url:
+        raise RuntimeError("PUBLIC_APP_URL or PAYSTACK_CALLBACK_BASE_URL is required for Paystack checkout")
+
+    customer_email = str(email or "").strip()
+    if not customer_email:
+        digits = "".join(ch for ch in str(phone or "") if ch.isdigit()) or "customer"
+        customer_email = f"{digits}@example.com"
+
+    payload = {
+        "amount": paystack_amount(amount),
+        "email": customer_email,
+        "currency": tenant.get("paystack_currency") or os.getenv("PAYSTACK_CURRENCY", "KES"),
+        "reference": reference,
+        "callback_url": f"{base_url}/api/paystack/callback",
+        "metadata": {
+            "tenant_id": tenant.get("id"),
+            "payment_id": payment_id,
+            "phone": phone,
+            **(metadata or {}),
+        },
+    }
+    if description:
+        payload["metadata"]["description"] = description
+
+    payload["subaccount"] = subaccount_code
+    payload["bearer"] = tenant.get("paystack_bearer") or "subaccount"
+
+    response = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text[:500]
+        public_message = "Payment gateway rejected the request. Please contact support."
+        status_code = 502
+        if response.status_code in {401, 403}:
+            public_message = "Payment is temporarily unavailable. Please contact support."
+            status_code = 503
+        raise PaymentProviderError(public_message, f"Paystack initialize failed {response.status_code}: {detail}", status_code) from exc
+    data = response.json()
+    if not data.get("status"):
+        raise PaymentProviderError("Payment gateway rejected the request. Please contact support.", data.get("message") or "Paystack rejected the transaction")
+    result = data.get("data") or {}
+    result.update({"reference": reference, "customer_email": customer_email, "currency": payload["currency"]})
+    return result
+
+
+def verify_paystack_transaction(tenant, reference):
+    secret = get_platform_paystack_secret()
+    response = requests.get(
+        f"https://api.paystack.co/transaction/verify/{reference}",
+        headers={"Authorization": f"Bearer {secret}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("status"):
+        raise RuntimeError(data.get("message") or "Paystack verification failed")
+    return data.get("data") or {}
+
+
+def verify_paystack_signature(raw_body, signature, secret):
+    if not signature or not secret:
+        return False
+    digest = hmac.new(str(secret).encode(), raw_body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(digest, str(signature))
+
+
+def has_mikrotik_credentials(tenant):
+    return bool(tenant.get("mikrotik_host") and tenant.get("mikrotik_user") and tenant.get("mikrotik_pass"))
+
+
+def normalize_rate_limit(speed):
+    value = str(speed or "").strip()
+    if not value:
+        return None
+    if "/" in value:
+        return "".join(value.split())
+    amount = "".join(ch for ch in value if ch.isdigit() or ch == ".")
+    unit = "".join(ch for ch in value if ch.isalpha()).lower() or "m"
+    router_unit = "G" if unit.startswith("g") else "K" if unit.startswith("k") else "M"
+    return f"{amount}{router_unit}/{amount}{router_unit}" if amount else value.replace(" ", "")
+
+
+class RouterOSAPIError(RuntimeError):
+    pass
+
+
+class RouterOSPath:
+    def __init__(self, api, path):
+        self.api = api
+        self.path = path
+
+    @property
+    def command_base(self):
+        return "/" + "/".join(self.path)
+
+    def select(self):
+        return self.api.command(f"{self.command_base}/print")
+
+    def add(self, **fields):
+        rows = self.api.command(f"{self.command_base}/add", fields)
+        return (rows[0] or {}).get("ret") if rows else None
+
+    def update(self, **fields):
+        item_id = fields.pop(".id", None) or fields.pop("id", None)
+        if not item_id:
+            raise RouterOSAPIError("RouterOS item id is required")
+        return self.api.command(f"{self.command_base}/set", {".id": item_id, **fields})
+
+    def remove(self, item_id):
+        return self.api.command(f"{self.command_base}/remove", {".id": item_id})
+
+
+class RouterOSAPI:
+    def __init__(self, host, username, password, port=8728, timeout=4, secure=False, verify_ssl=False,
+                 connect_timeout=None, read_timeout=None):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.port = int(port or (8729 if secure else 8728))
+        self.connect_timeout = connect_timeout if connect_timeout is not None else min(timeout, 5)
+        self.read_timeout = read_timeout if read_timeout is not None else max(timeout, 20)
+        self.timeout = self.read_timeout
+        self.secure = secure
+        self.verify_ssl = verify_ssl
+        self.sock = None
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
+        if self.secure:
+            context = ssl.create_default_context()
+            if not self.verify_ssl:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self.sock = context.wrap_socket(raw, server_hostname=self.host)
+        else:
+            self.sock = raw
+        self.sock.settimeout(self.read_timeout)
+        self.login()
+        return self
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+    def path(self, *path):
+        return RouterOSPath(self, tuple(path))
+
+    def _write_word(self, word):
+        data = str(word).encode("utf-8")
+        length = len(data)
+        if length < 0x80:
+            prefix = bytes([length])
+        elif length < 0x4000:
+            prefix = bytes([(length >> 8) | 0x80, length & 0xFF])
+        elif length < 0x200000:
+            prefix = bytes([(length >> 16) | 0xC0, (length >> 8) & 0xFF, length & 0xFF])
+        elif length < 0x10000000:
+            prefix = bytes([(length >> 24) | 0xE0, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
+        else:
+            prefix = bytes([0xF0, (length >> 24) & 0xFF, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF])
+        self.sock.sendall(prefix + data)
+
+    def _read_length(self):
+        first = self.sock.recv(1)
+        if not first:
+            raise RouterOSAPIError("RouterOS connection closed")
+        value = first[0]
+        if (value & 0x80) == 0:
+            return value
+        if (value & 0xC0) == 0x80:
+            return ((value & ~0xC0) << 8) + self.sock.recv(1)[0]
+        if (value & 0xE0) == 0xC0:
+            chunk = self.sock.recv(2)
+            return ((value & ~0xE0) << 16) + (chunk[0] << 8) + chunk[1]
+        if (value & 0xF0) == 0xE0:
+            chunk = self.sock.recv(3)
+            return ((value & ~0xF0) << 24) + (chunk[0] << 16) + (chunk[1] << 8) + chunk[2]
+        chunk = self.sock.recv(4)
+        return (chunk[0] << 24) + (chunk[1] << 16) + (chunk[2] << 8) + chunk[3]
+
+    def _read_word(self):
+        length = self._read_length()
+        if length == 0:
+            return ""
+        data = b""
+        while len(data) < length:
+            part = self.sock.recv(length - len(data))
+            if not part:
+                raise RouterOSAPIError("RouterOS connection closed while reading")
+            data += part
+        return data.decode("utf-8", errors="replace")
+
+    def _write_sentence(self, words):
+        for word in words:
+            self._write_word(word)
+        self._write_word("")
+
+    def _read_sentence(self):
+        words = []
+        while True:
+            word = self._read_word()
+            if word == "":
+                return words
+            words.append(word)
+
+    def _read_response(self):
+        rows = []
+        while True:
+            sentence = self._read_sentence()
+            if not sentence:
+                continue
+            tag = sentence[0]
+            attrs = {}
+            for word in sentence[1:]:
+                if not word.startswith("="):
+                    continue
+                try:
+                    _, key, value = word.split("=", 2)
+                except ValueError:
+                    continue
+                attrs[key] = value
+            if tag == "!re":
+                rows.append(attrs)
+            elif tag == "!done":
+                return rows
+            elif tag in {"!trap", "!fatal"}:
+                raise RouterOSAPIError(attrs.get("message") or f"RouterOS API returned {tag}")
+
+    def login(self):
+        self.command("/login", {"name": self.username, "password": self.password})
+
+    def command(self, command, attrs=None):
+        words = [command]
+        for key, value in (attrs or {}).items():
+            if value is None:
+                continue
+            words.append(f"={key}={value}")
+        self._write_sentence(words)
+        return self._read_response()
+
+
+def router_connect(tenant):
+    return RouterOSAPI(
+        host=tenant.get("mikrotik_host"),
+        username=tenant.get("mikrotik_user"),
+        password=tenant.get("mikrotik_pass"),
+        port=int(tenant.get("mikrotik_port") or 8728),
+        connect_timeout=int(tenant.get("mikrotik_connect_timeout") or 5),
+        read_timeout=int(tenant.get("mikrotik_timeout") or 20),
+        secure=int(tenant.get("mikrotik_port") or 8728) == 8729,
+    ).connect()
+
+
+def router_items(tenant, *path):
+    if not has_mikrotik_credentials(tenant):
+        return []
+    api = router_connect(tenant)
+    try:
+        return list(api.path(*path).select())
+    finally:
+        api.close()
+
+
+def router_first(tenant, *path):
+    items = router_items(tenant, *path)
+    return items[0] if items else {}
+
+
+def router_update_item(tenant, path, item_id, fields):
+    api = router_connect(tenant)
+    try:
+        return api.path(*path).update(**{".id": item_id, **fields})
+    finally:
+        api.close()
+
+
+def router_add_item(tenant, path, fields):
+    api = router_connect(tenant)
+    try:
+        return api.path(*path).add(**fields)
+    finally:
+        api.close()
+
+
+def find_router_item_by_fields(api, path, fields):
+    for item in api.path(*path).select():
+        if all(str(item.get(key) or "") == str(value or "") for key, value in fields.items()):
+            return item
+    return None
+
+
+def find_router_item(api, path, name):
+    for item in api.path(*path).select():
+        if item.get("name") == name:
+            return item
+    return None
+
+
+def upsert_router_profile(tenant, path, name, speed):
+    if not has_mikrotik_credentials(tenant):
+        return None
+    api = router_connect(tenant)
+    try:
+        router_path = api.path(*path)
+        existing = find_router_item(api, path, name)
+        fields = {"name": name}
+        rate_limit = normalize_rate_limit(speed)
+        if rate_limit:
+            fields["rate-limit"] = rate_limit
+        if existing and existing.get(".id"):
+            router_path.update(**{".id": existing[".id"], **fields})
+            return existing[".id"]
+        return router_path.add(**fields)
+    finally:
+        api.close()
+
+
+def create_ppp_profile(tenant, name, speed):
+    return upsert_router_profile(tenant, ("ppp", "profile"), name, speed)
+
+
+def create_hotspot_profile(tenant, name, speed):
+    return upsert_router_profile(tenant, ("ip", "hotspot", "user", "profile"), name, speed)
+
+
+def package_service_type(package):
+    service_type = str((package or {}).get("service_type") or "").strip().lower()
+    return service_type if service_type in {"hotspot", "pppoe"} else "hotspot"
+
+
+def captive_portal_url(tenant):
+    base = get_public_base_url().rstrip("/")
+    return f"{base}/api/captive/{tenant.get('id')}"
+
+
+def captive_portal_host(tenant):
+    return urlparse(captive_portal_url(tenant)).netloc.split("@")[-1].split(":")[0]
+
+
+def mikrotik_managed_bridge_name(tenant=None):
+    return str(
+        os.getenv("MIKROTIK_BRIDGE_NAME")
+        or (tenant or {}).get("mikrotik_bridge_name")
+        or "billing-bridge"
+    ).strip() or "billing-bridge"
+
+
+def upsert_router_item(api, path, match_fields, fields):
+    router_path = api.path(*path)
+    existing = find_router_item_by_fields(api, path, match_fields)
+    if existing and existing.get(".id"):
+        router_path.update(**{".id": existing[".id"], **fields})
+        return existing[".id"]
+    return router_path.add(**fields)
+
+
+def hotspot_portal_target(portal_url, extra_param):
+    separator = "&" if "?" in str(portal_url or "") else "?"
+    host = urlparse(str(portal_url or "")).netloc.lower()
+    ngrok_param = "ngrok-skip-browser-warning=true&" if host.endswith("ngrok-free.dev") else ""
+    return f"{portal_url}{separator}{ngrok_param}{extra_param}"
+
+
+def hotspot_login_redirect_html(portal_url):
+    target = hotspot_portal_target(portal_url, "ip=$(ip)&mac=$(mac)&error=$(error)")
+    return (
+        "<!doctype html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Internet Access</title>"
+        "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
+        "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:12px 16px;border-radius:6px;font-weight:700}</style>"
+        "</head><body>"
+        "<h3>Internet Packages</h3>"
+        "<p>Select a package and pay to continue browsing.</p>"
+        f"<a href='{target}'>Open packages</a>"
+        "</body></html>"
+    )
+
+
+def hotspot_error_redirect_html(portal_url):
+    target = hotspot_portal_target(portal_url, "ip=$(ip)&mac=$(mac)&mikrotik_error=$(error)")
+    return (
+        "<!doctype html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Internet Access</title>"
+        "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
+        "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:11px 14px;border-radius:6px;font-weight:700}</style>"
+        "</head><body>"
+        "<h3>Return to Internet Packages</h3>"
+        "<p>Your session needs a package before internet access can continue.</p>"
+        f"<a href='{target}'>Open packages</a>"
+        "</body></html>"
+    )
+
+
+def hotspot_alogin_redirect_html(portal_url):
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Authorized</title></head><body>"
+        "<div style='padding:20px; font-family:sans-serif; text-align:center;'>"
+        "<h3>Access Granted</h3>"
+        "<p>Please wait while your connection initializes...</p>"
+        "</div>"
+        "<script>"
+        "var dest = '$(link-orig)';"
+        f"window.location.replace(dest ? dest : '{portal_url}');"
+        "</script>"
+        f"<noscript><a href='{portal_url}'>Continue</a></noscript>"
+        "</body></html>"
+    )
+
+
+def hotspot_redirect_html():
+    return (
+        "<!doctype html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<meta http-equiv='refresh' content='1; url=$(link-orig)'>"
+        "<title>Redirecting...</title>"
+        "</head><body>"
+        "<p style='font-family:Arial,sans-serif;text-align:center;padding:20px'>Connecting...</p>"
+        "<script>setTimeout(function(){window.location.href='$(link-orig)';},300);</script>"
+        "</body></html>"
+    )
+
+
+def ensure_hotspot_login_redirect(api, portal_url):
+    files_to_push = {
+        "hotspot/login.html": hotspot_login_redirect_html(portal_url),
+        "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
+        "hotspot/redirect.html": hotspot_redirect_html(),
+        "hotspot/error.html": hotspot_error_redirect_html(portal_url),
+    }
+    existing_files = list(api.path("file").select())
+    pushed = {}
+    for name, contents in files_to_push.items():
+        for target_name in (name, f"flash/{name}"):
+            existing = next((item for item in existing_files if item.get("name") == target_name), None)
+            try:
+                if existing and existing.get(".id"):
+                    api.path("file").update(**{".id": existing[".id"], "contents": contents})
+                    pushed[target_name] = "updated"
+                else:
+                    api.path("file").add(**{"name": target_name, "contents": contents})
+                    pushed[target_name] = "created"
+            except Exception:
+                pushed[target_name] = "skipped"
+    return pushed
+
+
+def ensure_hotspot_captive_portal(tenant):
+    if not has_mikrotik_credentials(tenant):
+        return None
+
+    portal_url = captive_portal_url(tenant)
+    portal_host = captive_portal_host(tenant)
+    profile_name = "billing-saas-captive"
+    api = router_connect(tenant)
+    try:
+        upsert_router_item(
+            api,
+            ("ip", "hotspot", "profile"),
+            {"name": profile_name},
+            {
+                "name": profile_name,
+                "login-by": "http-pap,http-chap",
+                "use-radius": "no",
+                "html-directory": "hotspot",
+                "comment": f"billing-saas captive portal: {portal_url}",
+            },
+        )
+        for host in [
+            portal_host,
+            "checkout.paystack.com",
+            "api.paystack.co",
+            "*.paystack.co",
+            "*.paystack.com",
+        ]:
+            if not host:
+                continue
+            upsert_router_item(
+                api,
+                ("ip", "hotspot", "walled-garden"),
+                {"dst-host": host, "comment": "billing-saas captive portal access"},
+                {
+                    "action": "allow",
+                    "dst-host": host,
+                    "comment": "billing-saas captive portal access",
+                    "disabled": "no",
+                },
+            )
+        login_page = None
+        try:
+            login_page = ensure_hotspot_login_redirect(api, portal_url)
+        except Exception:
+            login_page = None
+        return {"profile": profile_name, "portal_url": portal_url, "portal_host": portal_host, "login_page": login_page}
+    finally:
+        api.close()
+
+
+def router_interface_status(tenant):
+    if not has_mikrotik_credentials(tenant):
+        return {}
+
+    api = router_connect(tenant)
+    try:
+        def items(*path):
+            return list(api.path(*path).select())
+
+        resource = (items("system", "resource") or [{}])[0]
+        routerboard = (items("system", "routerboard") or [{}])[0]
+        interfaces = items("interface")
+        pppoe_servers = items("interface", "pppoe-server", "server")
+        hotspot_servers = items("ip", "hotspot")
+        ppp_profiles = items("ppp", "profile")
+        hotspot_profiles = items("ip", "hotspot", "user", "profile")
+    finally:
+        api.close()
+
+    return {
+        "device": {
+            "board_name": resource.get("board-name") or routerboard.get("model"),
+            "version": resource.get("version"),
+            "uptime": resource.get("uptime"),
+            "cpu_load": resource.get("cpu-load"),
+            "free_memory": resource.get("free-memory"),
+            "total_memory": resource.get("total-memory"),
+            "architecture": resource.get("architecture-name"),
+        },
+        "interfaces": [
+            {
+                "id": item.get(".id"),
+                "name": item.get("name"),
+                "type": item.get("type"),
+                "running": item.get("running") in {True, "true", "yes"},
+                "disabled": item.get("disabled") in {True, "true", "yes"},
+                "mac_address": item.get("mac-address"),
+                "comment": item.get("comment", ""),
+                "mtu": item.get("mtu"),
+            }
+            for item in interfaces
+        ],
+        "pppoe_servers": [
+            {
+                "id": item.get(".id"),
+                "name": item.get("service-name") or item.get("name"),
+                "interface": item.get("interface"),
+                "default_profile": item.get("default-profile"),
+                "disabled": item.get("disabled") in {True, "true", "yes"},
+            }
+            for item in pppoe_servers
+        ],
+        "hotspot_servers": [
+            {
+                "id": item.get(".id"),
+                "name": item.get("name"),
+                "interface": item.get("interface"),
+                "profile": item.get("profile"),
+                "disabled": item.get("disabled") in {True, "true", "yes"},
+            }
+            for item in hotspot_servers
+        ],
+        "profiles": {
+            "pppoe": [{"name": item.get("name"), "rate_limit": item.get("rate-limit")} for item in ppp_profiles],
+            "hotspot": [{"name": item.get("name"), "rate_limit": item.get("rate-limit")} for item in hotspot_profiles],
+        },
+    }
+
+
+def _remove_port_from_any_bridge(api, interface_name):
+    """Finds if an interface is inside any bridge port configuration and completely removes it."""
+    for port in api.path("interface", "bridge", "port").select():
+        if port.get("interface") == interface_name:
+            try:
+                api.path("interface", "bridge", "port").remove(port[".id"])
+            except Exception:
+                pass
+
+
+def _clear_wireless_password_for_hotspot(api, interface_name):
+    """Make assigned legacy WLAN interfaces open so Hotspot owns authentication."""
+    wireless_rows = []
+    try:
+        wireless_rows = list(api.path("interface", "wireless").select())
+    except Exception:
+        return None
+
+    wireless = next((item for item in wireless_rows if item.get("name") == interface_name), None)
+    if not wireless or not wireless.get(".id"):
+        return None
+
+    profile_name = "billing-saas-open"
+    try:
+        profiles = list(api.path("interface", "wireless", "security-profiles").select())
+        existing = next((item for item in profiles if item.get("name") == profile_name), None)
+        fields = {
+            "name": profile_name,
+            "mode": "none",
+            "authentication-types": "",
+            "wpa-pre-shared-key": "",
+            "wpa2-pre-shared-key": "",
+            "supplicant-identity": "billing-saas",
+        }
+        if existing and existing.get(".id"):
+            api.path("interface", "wireless", "security-profiles").update(**{".id": existing[".id"], **fields})
+        else:
+            api.path("interface", "wireless", "security-profiles").add(**fields)
+    except Exception:
+        pass
+
+    try:
+        api.path("interface", "wireless").update(**{".id": wireless[".id"], "security-profile": profile_name, "disabled": "no"})
+        return profile_name
+    except Exception:
+        return None
+
+
+def configure_router_port(tenant, interface_name, service_type, profile_name="default"):
+    service_type = str(service_type or "").lower().strip()
+    if service_type not in {"pppoe", "hotspot"}:
+        raise ValueError("Port service must be either pppoe or hotspot")
+
+    api = router_connect(tenant)
+    try:
+        interfaces = list(api.path("interface").select())
+        interface = next((item for item in interfaces if item.get("name") == interface_name), None)
+        if not interface or not interface.get(".id"):
+            raise ValueError("Router interface not found")
+
+        # 1. Remove the interface from any existing bridge
+        _remove_port_from_any_bridge(api, interface_name)
+
+        # 2. Shift the interface into the billing-saas managed bridge
+        managed_bridge = mikrotik_managed_bridge_name(tenant)
+        existing_bridges = list(api.path("interface", "bridge").select())
+        if not any(b.get("name") == managed_bridge for b in existing_bridges):
+            api.path("interface", "bridge").add(name=managed_bridge, comment="billing-saas managed bridge")
+
+        # Add the target interface to our managed bridge
+        api.path("interface", "bridge", "port").add(bridge=managed_bridge, interface=interface_name)
+        bind_interface = managed_bridge
+
+        wireless_security_profile = None
+        if service_type == "hotspot":
+            wireless_security_profile = _clear_wireless_password_for_hotspot(api, interface_name)
+
+        bridge_note = f"Interface '{interface_name}' successfully moved into billing-saas managed bridge '{managed_bridge}'."
+
+        if service_type == "pppoe":
+            api.path("interface").update(**{".id": interface[".id"], "comment": f"billing-saas:{service_type}:profile={profile_name or 'default'}"})
+            servers = list(api.path("interface", "pppoe-server", "server").select())
+            existing = next((item for item in servers if item.get("interface") == bind_interface), None)
+            fields = {
+                "service-name": f"billing-{interface_name}",
+                "interface": bind_interface,
+                "default-profile": profile_name or "default",
+                "one-session-per-host": "yes",
+                "disabled": "no",
+            }
+            if existing and existing.get(".id"):
+                api.path("interface", "pppoe-server", "server").update(**{".id": existing[".id"], **fields})
+                return {"updated": True, "service_type": service_type, "interface": interface_name, "bound_interface": bind_interface, "note": bridge_note}
+            api.path("interface", "pppoe-server", "server").add(**fields)
+            return {"created": True, "service_type": service_type, "interface": interface_name, "bound_interface": bind_interface, "note": bridge_note}
+
+        captive = ensure_hotspot_captive_portal(tenant) or {}
+        hotspot_profile = captive.get("profile") or "billing-saas-captive"
+        api.path("interface").update(**{".id": interface[".id"], "comment": f"billing-saas:hotspot:portal={captive.get('portal_url') or ''}".strip()})
+        
+        servers = list(api.path("ip", "hotspot").select())
+        existing = next((item for item in servers if item.get("interface") == bind_interface), None)
+        fields = {
+            "name": f"billing-hotspot-{interface_name}",
+            "interface": bind_interface,
+            "profile": hotspot_profile,
+            "disabled": "no",
+            "comment": f"billing-saas captive portal: {captive.get('portal_url') or ''}".strip(),
+        }
+        if existing and existing.get(".id"):
+            api.path("ip", "hotspot").update(**{".id": existing[".id"], **fields})
+            return {"updated": True, "service_type": service_type, "interface": interface_name, "bound_interface": bind_interface, "profile": hotspot_profile, "portal_url": captive.get("portal_url"), "wireless_security_profile": wireless_security_profile, "note": bridge_note}
+        api.path("ip", "hotspot").add(**fields)
+        return {"created": True, "service_type": service_type, "interface": interface_name, "bound_interface": bind_interface, "profile": hotspot_profile, "portal_url": captive.get("portal_url"), "wireless_security_profile": wireless_security_profile, "note": bridge_note}
+    finally:
+        api.close()
+
+
+def _rsc_escape(value):
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+
+def _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name=None):
+    bridge_name = bridge_name or mikrotik_managed_bridge_name()
+    portal_comment = portal_url or ""
+    portal_host = urlparse(portal_url or "").netloc.split("@")[-1].split(":")[0]
+    login_html = _rsc_escape(hotspot_login_redirect_html(portal_url)) if portal_url else ""
+    alogin_html = _rsc_escape(hotspot_alogin_redirect_html(portal_url)) if portal_url else ""
+    redirect_html = _rsc_escape(hotspot_redirect_html())
+    error_html = _rsc_escape(hotspot_error_redirect_html(portal_url)) if portal_url else ""
+
+    # --- Hotspot file writes with LOGGED errors and verification ---
+    hotspot_file_writes = ""
+    if portal_url:
+        hotspot_file_writes = (
+            f':local billingLogin "{login_html}"; '
+            f':do {{ /file set [find name="hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="hotspot/login.html" contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/login.html" }} }}; '
+            f':do {{ /file set [find name="flash/hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="flash/hotspot/login.html" contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/login.html" }} }}; '
+            f':local billingAlogin "{alogin_html}"; '
+            f':do {{ /file set [find name="hotspot/alogin.html"] contents=$billingAlogin }} on-error={{ :do {{ /file add name="hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/alogin.html" }} }}; '
+            f':do {{ /file set [find name="flash/hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :do {{ /file add name="flash/hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/alogin.html" }} }}; '
+            f':local billingRedirect "{redirect_html}"; '
+            f':do {{ /file set [find name="hotspot/redirect.html"] contents=$billingRedirect }} on-error={{ :do {{ /file add name="hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/redirect.html" }} }}; '
+            f':do {{ /file set [find name="flash/hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :do {{ /file add name="flash/hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/redirect.html" }} }}; '
+            f':local billingError "{error_html}"; '
+            f':do {{ /file set [find name="hotspot/error.html"] contents=$billingError }} on-error={{ :do {{ /file add name="hotspot/error.html" contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/error.html" }} }}; '
+            f':do {{ /file set [find name="flash/hotspot/error.html" contents=$billingError }} on-error={{ :do {{ /file add name="flash/hotspot/error.html" contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/error.html" }} }}; '
+            # Write minimal companion files that RouterOS hotspot server expects
+            f':do {{ /file add name="hotspot/status.html" contents="<html><body>Processing...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/status.html" }}; '
+            f':do {{ /file add name="hotspot/rlogin.html" contents="<html><body>Redirecting...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/rlogin.html" }}; '
+            f':do {{ /file add name="hotspot/radvert.html" contents="<html><body></body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/radvert.html" }}; '
+        )
+
+    # --- Default PPPoE / Hotspot secret cleanup ---
+    # Remove any pre-existing /ppp secret entries that are NOT managed by us
+    ppp_secret_cleanup = (
+        f':foreach s in=[/ppp secret find] do={{ '
+        f'  :if ([/ppp secret get $s comment] != "billing-saas-managed") do={{ '
+        f'    :do {{ /ppp secret remove $s }} on-error={{}} '
+        f'  }} '
+        f'}}; '
+    )
+
+    hotspot_setup = ""
+    if portal_url:
+        hotspot_setup = (
+            f':do {{ /ip hotspot profile add name="billing-saas-captive" login-by=http-pap,http-chap use-radius=no html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }} '
+            f'on-error={{ /ip hotspot profile set [find name="billing-saas-captive"] login-by=http-pap,http-chap use-radius=no html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }}; '
+            f':do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            f':do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            f':do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            f':do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.co" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            f':do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.com" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            f':local billingPortalIp ""; '
+            f':do {{ :set billingPortalIp [:resolve "{portal_host}"] }} on-error={{ :log warning "Billing SaaS portal DNS resolve failed" }}; '
+            f':if ([:len $billingPortalIp] > 0) do={{ '
+            f':do {{ /ip hotspot walled-garden ip add action=accept dst-address=$billingPortalIp protocol=tcp dst-port=80 comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden ip add failed" }}; '
+            f':do {{ /ip hotspot walled-garden ip add action=accept dst-address=$billingPortalIp protocol=tcp dst-port=443 comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden ip add failed" }}; '
+            f'}}; '
+            f'{hotspot_file_writes}'
+        )
+
+    # --- Default PPPoE server creation (at provisioning time, not lazy per-port) ---
+    pppoe_server_block = (
+        f'  :local billingSvc [/interface pppoe-server server find interface="{bridge_name}"]; '
+        f'  :if ([:len $billingSvc] > 0) do={{ /interface pppoe-server server set $billingSvc service-name="billing-{interface_name}" default-profile="{profile_name}" one-session-per-host=yes disabled=no }} else={{ /interface pppoe-server server add service-name="billing-{interface_name}" interface="{bridge_name}" default-profile="{profile_name}" one-session-per-host=yes disabled=no }}; '
+    )
+
+    # --- Hotspot server creation ---
+    hotspot_server_block = (
+        f'  {hotspot_setup}'
+        f'  :do {{ /interface wireless security-profiles add name="billing-saas-open" mode=none authentication-types="" wpa-pre-shared-key="" wpa2-pre-shared-key="" supplicant-identity="billing-saas" }} on-error={{ /interface wireless security-profiles set [find name="billing-saas-open"] mode=none authentication-types="" wpa-pre-shared-key="" wpa2-pre-shared-key="" supplicant-identity="billing-saas" }}; '
+        f'  :do {{ /interface wireless set [find name="{interface_name}"] security-profile="billing-saas-open" disabled=no }} on-error={{}}; '
+        f'  :local billingHs [/ip hotspot find interface="{bridge_name}"]; '
+        f'  :if ([:len $billingHs] > 0) do={{ /ip hotspot set $billingHs name="billing-hotspot-{interface_name}" profile="billing-saas-captive" disabled=no comment="billing-saas captive portal: {portal_comment}" }} else={{ /ip hotspot add name="billing-hotspot-{interface_name}" interface="{bridge_name}" profile="billing-saas-captive" disabled=no comment="billing-saas captive portal: {portal_comment}" }}; '
+    )
+
+    # --- Default secret cleanup (remove factory defaults so RADIUS is the only auth path) ---
+    cleanup_block = ppp_secret_cleanup
+
+    return (
+        f'/interface bridge port remove [find interface="{interface_name}"]; '
+        f':if ([:len [/interface bridge find name="{bridge_name}"]] = 0) do={{ /interface bridge add name="{bridge_name}" comment="billing-saas managed bridge" }}; '
+        f'/interface bridge port add bridge="{bridge_name}" interface="{interface_name}"; '
+        f':do {{ /interface set [find name="{interface_name}"] comment="billing-saas:{service_type}:portal={portal_comment}" }} on-error={{ :log warning "Billing SaaS: failed to set interface comment" }}; '
+        f'{cleanup_block}'
+        f':if ("{service_type}" = "pppoe") do={{ '
+        f'  {pppoe_server_block}'
+        f'}} else={{ '
+        f'  {hotspot_server_block}'
+        f'}}; '
+    )
+
+
+def upsert_customer_access(tenant, customer, disabled=False):
+    # When RADIUS is enabled, skip the RouterOS API call entirely.
+    # The router will ask the RADIUS server at login time, so there is
+    # nothing to push. The radius_secret is managed by sync_radius_customer.
+    tenant_radius_enabled = tenant.get("radius_enabled") if isinstance(tenant, dict) else getattr(tenant, "radius_enabled", False)
+    if tenant_radius_enabled:
+        return {"skipped": True, "reason": "RADIUS enabled — auth handled by RADIUS server, no RouterOS API call needed"}
+
+    if not has_mikrotik_credentials(tenant):
+        return None
+    service_type = customer.get("service_type") or "pppoe"
+    api = router_connect(tenant)
+    try:
+        if service_type == "tv":
+            mac_address = str(customer.get("mac_address") or customer.get("username") or "").strip().upper()
+            if not mac_address:
+                return None
+            path = ("ip", "hotspot", "ip-binding")
+            router_path = api.path(*path)
+            existing = find_router_item_by_fields(api, path, {"mac-address": mac_address})
+            fields = {
+                "mac-address": mac_address,
+                "type": "bypassed",
+                "comment": f"billing-saas tv access: {customer.get('package_name') or customer.get('package') or ''}".strip(),
+                "disabled": "yes" if disabled else "no",
+            }
+            if existing and existing.get(".id"):
+                router_path.update(**{".id": existing[".id"], **fields})
+                return existing[".id"]
+            return router_path.add(**fields)
+        path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
+        router_path = api.path(*path)
+        existing = find_router_item(api, path, customer.get("username"))
+        
+        # Explicit password stripping or validation logic per specifications
+        fields = {
+            "name": customer.get("username"),
+            "password": "",  # Blanking password requirement out for seamless portal authentication
+            "profile": customer.get("package_name") or customer.get("package"),
+            "disabled": "yes" if disabled else "no",
+        }
+        if service_type == "pppoe":
+            fields["password"] = customer.get("password")  # Keep for PPPoE authentication
+            fields["service"] = "pppoe"
+        if existing and existing.get(".id"):
+            router_path.update(**{".id": existing[".id"], **fields})
+            return existing[".id"]
+        return router_path.add(**fields)
+    finally:
+        api.close()
+
+
+def set_customer_enabled(tenant, username, service_type="hotspot", enabled=True):
+    # When RADIUS is enabled, use CoA Disconnect instead of RouterOS API
+    tenant_id = tenant.get("id") if isinstance(tenant, dict) else str(tenant.id)
+    tenant_radius_enabled = tenant.get("radius_enabled") if isinstance(tenant, dict) else tenant.radius_enabled
+
+    if tenant_radius_enabled and not enabled:
+        try:
+            from .models import Tenant as TenantModel, Customer as CustomerModel
+            from .radius_coa import radius_disconnect_customer
+
+            tenant_obj = TenantModel.objects.get(pk=tenant_id) if isinstance(tenant, dict) else tenant
+            result = radius_disconnect_customer(tenant_obj, username)
+            # Also update Postgres Customer.status so the RADIUS server
+            # rejects future Access-Requests for this user.
+            try:
+                CustomerModel.objects.filter(
+                    tenant=tenant_obj, username=username
+                ).update(status="inactive")
+            except Exception:
+                pass
+            if result.get("success"):
+                return result
+            # If CoA failed, fall through to the direct API path
+        except Exception:
+            pass  # Fall through to direct API path
+
+    if tenant_radius_enabled and enabled:
+        try:
+            from .models import Customer as CustomerModel
+            tenant_obj = TenantModel.objects.get(pk=tenant_id) if isinstance(tenant, dict) else tenant
+            CustomerModel.objects.filter(
+                tenant=tenant_obj, username=username
+            ).update(status="active")
+        except Exception:
+            pass
+
+    if not has_mikrotik_credentials(tenant):
+        return None
+    api = router_connect(tenant)
+    try:
+        if service_type == "tv":
+            path = ("ip", "hotspot", "ip-binding")
+            existing = find_router_item_by_fields(api, path, {"mac-address": str(username or "").strip().upper()})
+            if not existing or not existing.get(".id"):
+                return None
+            return api.path(*path).update(**{".id": existing[".id"], "disabled": "no" if enabled else "yes"})
+        path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
+        existing = find_router_item(api, path, username)
+        if not existing or not existing.get(".id"):
+            return None
+        result = api.path(*path).update(**{".id": existing[".id"], "disabled": "no" if enabled else "yes"})
+
+        if not enabled:
+            active_path = ("ppp", "active") if service_type == "pppoe" else ("ip", "hotspot", "active")
+            match_field = "name" if service_type == "pppoe" else "user"
+            active = find_router_item_by_fields(api, active_path, {match_field: username})
+            if active and active.get(".id"):
+                try:
+                    api.path(*active_path).remove(active[".id"])
+                except Exception:
+                    pass
+
+        return result
+    finally:
+        api.close()
+
+
+def delete_router_customer(tenant, username, service_type="pppoe"):
+    if not has_mikrotik_credentials(tenant) or not username:
+        return None
+    api = router_connect(tenant)
+    try:
+        if service_type == "tv":
+            path = ("ip", "hotspot", "ip-binding")
+            existing = find_router_item_by_fields(api, path, {"mac-address": str(username or "").strip().upper()})
+            if not existing or not existing.get(".id"):
+                return None
+            return api.path(*path).remove(existing[".id"])
+        path = ("ppp", "secret") if service_type == "pppoe" else ("ip", "hotspot", "user")
+        existing = find_router_item(api, path, username)
+        if not existing or not existing.get(".id"):
+            return None
+        return api.path(*path).remove(existing[".id"])
+    finally:
+        api.close()
+
+
+def whatsapp_enabled(tenant=None):
+    if tenant and tenant.get("whatsapp_enabled") is False:
+        return False
+    return os.getenv("WHATSAPP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def send_whatsapp_message(phone, message, tenant=None):
+    if not whatsapp_enabled(tenant):
+        return {"sent": False, "skipped": "disabled"}
+    token = os.getenv("WHATSAPP_API_TOKEN") or os.getenv("WHATSAPP_ACCESS_TOKEN")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    api_url = os.getenv("WHATSAPP_API_URL", "").strip()
+    if not api_url and phone_number_id:
+        version = os.getenv("WHATSAPP_API_VERSION", "v20.0")
+        api_url = f"https://graph.facebook.com/{version}/{phone_number_id}/messages"
+    if not token or not api_url:
+        return {"sent": False, "skipped": "missing_credentials"}
+
+    recipient = normalize_phone(phone)
+    if not recipient:
+        return {"sent": False, "skipped": "missing_phone"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "text",
+        "text": {"preview_url": False, "body": str(message or "")},
+    }
+    response = requests.post(
+        api_url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return {"sent": True, "response": response.json() if response.content else {}}
+
+
+def write_audit_log(admin_id=None, admin_email=None, action=None, target_id=None, target_type=None, request=None, metadata=None):
+    ref("admin_audit_logs").push(
+        {
+            "admin_id": admin_id,
+            "admin_email": admin_email,
+            "action": action,
+            "target_id": target_id,
+            "target_type": target_type,
+            "ip": request.META.get("REMOTE_ADDR") if request else None,
+            "user_agent": request.META.get("HTTP_USER_AGENT") if request else None,
+            "metadata": metadata or {},
+        }
+    )

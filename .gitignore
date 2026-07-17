@@ -1,0 +1,15 @@
+.env
+.env.production
+serviceAccount.json
+*firebase-adminsdk*.json
+config/*firebase-adminsdk*.json
+node_modules/
+frontend/node_modules/
+inspectorbot.py
+browserscript.js
+biling-saas-firebase-adminsdk-fbsvc-7785d4be23.json
+extracted_data_2026-06-03T06-13-32.json
+*.log
+__pycache__/
+*.py[cod]
+db.sqlite3
