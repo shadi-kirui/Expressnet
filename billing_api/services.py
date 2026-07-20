@@ -854,13 +854,9 @@ def hotspot_login_redirect_html(portal_url):
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<meta http-equiv='refresh' content='0; url={target}'>"
         "<title>Internet Access</title>"
-        "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
-        "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:12px 16px;border-radius:6px;font-weight:700}</style>"
         "</head><body>"
-        "<h3>Internet Packages</h3>"
-        "<p>Select a package and pay to continue browsing.</p>"
-        f"<a href='{target}'>Open packages</a>"
         f"<script>window.location.replace('{target}');</script>"
+        f"<a href='{target}'>Open packages</a>"
         "</body></html>"
     )
 
@@ -873,13 +869,9 @@ def hotspot_error_redirect_html(portal_url):
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<meta http-equiv='refresh' content='0; url={target}'>"
         "<title>Internet Access</title>"
-        "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
-        "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:11px 14px;border-radius:6px;font-weight:700}</style>"
         "</head><body>"
-        "<h3>Return to Internet Packages</h3>"
-        "<p>Your session needs a package before internet access can continue.</p>"
-        f"<a href='{target}'>Open packages</a>"
         f"<script>window.location.replace('{target}');</script>"
+        f"<a href='{target}'>Open packages</a>"
         "</body></html>"
     )
 
@@ -910,9 +902,8 @@ def hotspot_redirect_html(portal_url=None):
             f"<meta http-equiv='refresh' content='0; url={target}'>"
             "<title>Internet Packages</title>"
             "</head><body>"
-            "<p style='font-family:Arial,sans-serif;text-align:center;padding:20px'>Opening packages...</p>"
             f"<script>window.location.replace('{target}');</script>"
-            f"<noscript><p style='text-align:center'><a href='{target}'>Open packages</a></p></noscript>"
+            f"<a href='{target}'>Open packages</a>"
             "</body></html>"
         )
     return (
@@ -929,10 +920,7 @@ def hotspot_redirect_html(portal_url=None):
 
 
 def routeros_hotspot_file_script(files, log_prefix="Billing SaaS"):
-    parts = [
-        ':do { /file add name="hotspot" type=directory } on-error={};',
-        ':do { /file add name="flash/hotspot" type=directory } on-error={};',
-    ]
+    parts = []
     for index, (name, contents) in enumerate(files.items()):
         var_name = f"billingHotspotFile{index}"
         escaped_contents = _rsc_escape(contents)
@@ -941,7 +929,8 @@ def routeros_hotspot_file_script(files, log_prefix="Billing SaaS"):
                 f':local {var_name} "{escaped_contents}"; '
                 f':local {var_name}Id [/file find name="{target_name}"]; '
                 f':if ([:len ${var_name}Id] > 0) do={{ '
-                f'/file set ${var_name}Id contents=${var_name} '
+                f':do {{ /file set ${var_name}Id contents=${var_name} }} '
+                f'on-error={{ :log warning "{log_prefix}: failed to update {target_name}" }} '
                 f'}} else={{ '
                 f':do {{ /file add name="{target_name}" contents=${var_name} }} '
                 f'on-error={{ :log warning "{log_prefix}: failed to write {target_name}" }} '
@@ -950,15 +939,36 @@ def routeros_hotspot_file_script(files, log_prefix="Billing SaaS"):
     return " ".join(parts)
 
 
+def routeros_hotspot_fetch_script(portal_url, log_prefix="Billing SaaS"):
+    template_base = str(portal_url or "").rstrip("/") + "/hotspot-file"
+    separator = "&" if "?" in template_base else "?"
+    skip_warning = "ngrok-skip-browser-warning=true" if urlparse(str(portal_url or "")).netloc.lower().endswith("ngrok-free.dev") else ""
+    pages = ["login.html", "alogin.html", "redirect.html", "error.html", "status.html", "rlogin.html", "radvert.html"]
+    parts = []
+    for page in pages:
+        src_url = f"{template_base}/{page}"
+        if skip_warning:
+            src_url = f"{src_url}{separator}{skip_warning}"
+        src = _rsc_escape(src_url)
+        for target_name in (f"hotspot/{page}", f"flash/hotspot/{page}"):
+            dst = _rsc_escape(target_name)
+            parts.append(
+                f':do {{ /tool fetch url="{src}" dst-path="{dst}" }} '
+                f'on-error={{ :log warning "{log_prefix}: failed to fetch {dst}" }};'
+            )
+    return " ".join(parts)
+
+
 def ensure_hotspot_login_redirect(api, portal_url):
+    fallback_redirect_html = hotspot_redirect_html(portal_url)
     files_to_push = {
         "hotspot/login.html": hotspot_login_redirect_html(portal_url),
         "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-        "hotspot/redirect.html": hotspot_redirect_html(portal_url),
+        "hotspot/redirect.html": fallback_redirect_html,
         "hotspot/error.html": hotspot_error_redirect_html(portal_url),
-        "hotspot/status.html": "<html><body>Processing...</body></html>",
-        "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
-        "hotspot/radvert.html": "<html><body></body></html>",
+        "hotspot/status.html": fallback_redirect_html,
+        "hotspot/rlogin.html": fallback_redirect_html,
+        "hotspot/radvert.html": fallback_redirect_html,
     }
     existing_files = list(api.path("file").select())
     pushed = {}
@@ -1227,17 +1237,7 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
     # --- Hotspot file writes with LOGGED errors and verification ---
     hotspot_file_writes = ""
     if portal_url:
-        hotspot_file_writes = routeros_hotspot_file_script(
-            {
-                "hotspot/login.html": hotspot_login_redirect_html(portal_url),
-                "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-                "hotspot/redirect.html": hotspot_redirect_html(portal_url),
-                "hotspot/error.html": hotspot_error_redirect_html(portal_url),
-                "hotspot/status.html": "<html><body>Processing...</body></html>",
-                "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
-                "hotspot/radvert.html": "<html><body></body></html>",
-            }
-        )
+        hotspot_file_writes = routeros_hotspot_fetch_script(portal_url)
 
     # --- Default PPPoE / Hotspot secret cleanup ---
     # Remove any pre-existing /ppp secret entries that are NOT managed by us

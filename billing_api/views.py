@@ -46,7 +46,7 @@ from .services import (
     hotspot_error_redirect_html,
     hotspot_login_redirect_html,
     hotspot_redirect_html,
-    routeros_hotspot_file_script,
+    routeros_hotspot_fetch_script,
     initiate_paystack_payment,
     iso_now,
     firebase_backup_configured,
@@ -60,6 +60,7 @@ from .services import (
     ref,
     _rsc_escape,
     _get_jwt_secret,
+    router_connect,
     router_interface_status,
     router_items,
     send_whatsapp_message,
@@ -710,6 +711,30 @@ def captive_portal_page(request, tenant_id):
 
 
 @csrf_exempt
+@api_view(["GET"])
+def captive_hotspot_file(request, tenant_id, page):
+    tenant = ref(f"tenants/{tenant_id}").get()
+    if not tenant:
+        return HttpResponse("Not found", status=404, content_type="text/plain")
+
+    portal_url = captive_portal_url({"id": tenant_id, **tenant})
+    redirect_html = hotspot_redirect_html(portal_url)
+    files = {
+        "login.html": hotspot_login_redirect_html(portal_url),
+        "alogin.html": hotspot_alogin_redirect_html(portal_url),
+        "redirect.html": redirect_html,
+        "error.html": hotspot_error_redirect_html(portal_url),
+        "status.html": redirect_html,
+        "rlogin.html": redirect_html,
+        "radvert.html": redirect_html,
+    }
+    content = files.get(str(page or "").strip().lower())
+    if not content:
+        return HttpResponse("Not found", status=404, content_type="text/plain")
+    return HttpResponse(content, content_type="text/html")
+
+
+@csrf_exempt
 @api_view(["POST"])
 def captive_portal_pay(request, tenant_id):
     data = body(request)
@@ -1137,7 +1162,7 @@ def package_add(request):
         }
     )
     if router_queued:
-        _queue_router_command(request, {"type": "sync_packages", "script": _package_profile_script({"id": new_ref.key, **data, **package_payload})})
+        _queue_router_command(request, {"type": "sync_packages", "script": _package_profile_script({"id": new_ref.key, **data, **package_payload}), "package_ids": [new_ref.key]})
     message = "Package and MikroTik profile created" if router_synced else "Package created and queued for MikroTik sync" if router_queued else "Package created. Sync router after MikroTik is connected."
     return ok({"success": True, "message": message, "packageId": new_ref.key}, 201)
 
@@ -1333,15 +1358,24 @@ def _package_profile_script(package):
     rate_limit_field = f' rate-limit="{rate_limit}"' if rate_limit else ""
     if service_type == "pppoe":
         return (
+            f':do {{ '
             f':if ([:len [/ppp profile find name="{name}"]] = 0) do={{'
             f' /ppp profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
-            f'else={{ /ppp profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }};'
+            f'else={{ /ppp profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }}; '
+            f'}} on-error={{ :log warning "Billing SaaS agent: PPPoE profile sync failed for {name}" }};'
         )
     return (
+        f':do {{ '
         f':if ([:len [/ip hotspot user profile find name="{name}"]] = 0) do={{'
         f' /ip hotspot user profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
-        f'else={{ /ip hotspot user profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }};'
+        f'else={{ /ip hotspot user profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }}; '
+        f'}} on-error={{ :log warning "Billing SaaS agent: Hotspot profile sync failed for {name}" }};'
     )
+
+
+def _hotspot_captive_file_script(tenant):
+    portal_url = captive_portal_url(tenant)
+    return routeros_hotspot_fetch_script(portal_url, "Billing SaaS agent")
 
 
 def _queue_all_customer_secrets(request):
@@ -1599,17 +1633,7 @@ def router_provision_script(request, token):
     def _rsc_escape(value):
         return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
-    hotspot_file_script = routeros_hotspot_file_script(
-        {
-            "hotspot/login.html": hotspot_login_redirect_html(portal_url),
-            "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-            "hotspot/redirect.html": hotspot_redirect_html(portal_url),
-            "hotspot/error.html": hotspot_error_redirect_html(portal_url),
-            "hotspot/status.html": "<html><body>Processing...</body></html>",
-            "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
-            "hotspot/radvert.html": "<html><body></body></html>",
-        }
-    )
+    hotspot_file_script = _hotspot_captive_file_script(tenant)
     snapshot_script = _router_snapshot_fetch_script(snapshot_url)
 
     wg_server_public_key = str(os.getenv("WG_SERVER_PUBLIC_KEY") or tenant.get("wg_server_public_key") or "").strip()
@@ -1791,7 +1815,7 @@ def router_provision_script(request, token):
         :do {{ :set billingWgPub [/interface wireguard get [find name=wg-saas] public-key] }} on-error={{}}
         :do {{ /tool fetch keep-result=no url=("{callback_url}{callback_join}wg_public_key=" . $billingWgPub . "&wg_tunnel_ip={_rsc_escape(wg_router_api_ip)}&bridge={_rsc_escape(bridge_name)}") }} on-error={{ :log warning "Billing SaaS provisioning callback failed" }}
         :do {{ /system scheduler remove [find name="billing-saas-agent"] }} on-error={{}}
-        /system scheduler add name="billing-saas-agent" interval=30s on-event=":do {{ /tool fetch url=\\"{agent_poll_url}\\" dst-path=billing-saas-cmd.rsc }} on-error={{}}; :do {{ /import billing-saas-cmd.rsc }} on-error={{}};"
+        /system scheduler add name="billing-saas-agent" interval=30s on-event=":do {{ /file remove [find name=\\"billing-saas-cmd.rsc\\"] }} on-error={{}}; :do {{ /tool fetch url=\\"{agent_poll_url}\\" dst-path=billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command fetch failed\\" }}; :if ([:len [/file find name=\\"billing-saas-cmd.rsc\\"]] > 0) do={{ :do {{ /import billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command import failed\\" }} }};"
         :log info "Billing SaaS provisioning complete. No ports were assigned -- open the dashboard, pull router ports, and assign each interface to Hotspot or PPPoE.";
         :put "Configuration completed successfully. No LAN ports were touched -- assign ports from the dashboard.";
         """
@@ -1826,7 +1850,11 @@ def router_agent_poll(request, token):
     })
 
     all_commands = tenant.get("pending_router_commands") or []
-    commands = [c for c in all_commands if c.get("status") == "pending"]
+    commands = [
+        c
+        for c in all_commands
+        if c.get("status") == "pending" or (c.get("status") == "delivered" and int(c.get("delivery_attempts") or 0) < 5)
+    ]
     base_url = public_base_url(request).rstrip("/")
     if not commands:
         return HttpResponse(':log info "Billing SaaS agent: no pending commands";\n', content_type="text/plain")
@@ -1835,24 +1863,30 @@ def router_agent_poll(request, token):
     delivered_at = iso_now()
     delivered_ids = {command.get("id") for command in commands if command.get("id")}
     for command in commands:
-        command_id = command.get("id")
-        script = command.get("script") or ""
-        # Special-case reboot: use the dedicated command instead of a generic script
-        if command.get("type") == "reboot":
-            script = "/system reboot;"
-        ack_url = f"{base_url}/api/router/agent/{token}/ack/{command_id}"
-        lines.append(script)
+        command_id = command.get("id") or secrets.token_hex(8)
+        script = str(command.get("script") or "").strip()
+        if not script:
+            lines.append(f':log warning "Billing SaaS agent: command {command_id} had no script";')
+            continue
+        lines.append(f':log info "Billing SaaS agent: running command {command_id} ({command.get("type") or "router"})";')
         lines.append(
-            f':do {{ /tool fetch keep-result=no url="{ack_url}" }} '
-            f'on-error={{ :log warning "Billing SaaS agent: ack failed for {command_id}" }};'
+            f':do {{ {script}; /tool fetch keep-result=no url="{base_url}/api/router/agent/{token}/ack/{command_id}" }} '
+            f'on-error={{ :log warning "Billing SaaS agent: command {command_id} failed" }}'
         )
-
+        if command.get("type") == "sync_packages":
+            package_ids = command.get("package_ids") or ([command.get("package_id")] if command.get("package_id") else [])
+            for package_id_value in package_ids:
+                ref(f"tenants/{tenant_id}/packages/{package_id_value}").update({
+                    "ppp_profile_status": "delivered",
+                    "ppp_profile_delivered_at": delivered_at,
+                })
     assignments = dict(tenant.get("router_port_assignments") or {})
     for command in all_commands:
-        if command.get("id") not in delivered_ids or command.get("status") != "pending":
+        if command.get("id") not in delivered_ids or command.get("status") not in {"pending", "delivered"}:
             continue
-        command["status"] = "applied"
-        command["applied_at"] = delivered_at
+        command["status"] = "delivered"
+        command["delivered_at"] = delivered_at
+        command["delivery_attempts"] = int(command.get("delivery_attempts") or 0) + 1
         command["ack_mode"] = "poll_delivery"
         interface_name = command.get("interface")
         if interface_name:
@@ -1862,7 +1896,7 @@ def router_agent_poll(request, token):
                 "profile": command.get("profile") or assignment.get("profile"),
                 "portal_url": command.get("portal_url") or assignment.get("portal_url"),
                 "bridge": command.get("bridge") or assignment.get("bridge"),
-                "status": "applied",
+                "status": "delivered",
                 "updated_at": delivered_at,
             })
             assignments[interface_name] = assignment
@@ -1893,7 +1927,7 @@ def router_agent_ack(request, token, command_id):
     updated = False
     applied_command = None
     for command in commands:
-        if command.get("id") == command_id and command.get("status") == "pending":
+        if command.get("id") == command_id and command.get("status") in {"pending", "delivered"}:
             command["status"] = "applied"
             command["applied_at"] = iso_now()
             updated = True
@@ -1909,11 +1943,18 @@ def router_agent_ack(request, token, command_id):
         if interface_name:
             assignments = dict(tenant.get("router_port_assignments") or {})
             assignment = assignments.get(interface_name)
-            if assignment and assignment.get("status") == "queued":
+            if assignment and assignment.get("status") in {"queued", "delivered"}:
                 assignment["status"] = "applied"
                 assignment["updated_at"] = iso_now()
                 assignments[interface_name] = assignment
                 ref(f"tenants/{tenant_id}").update({"router_port_assignments": assignments})
+        if (applied_command or {}).get("type") == "sync_packages":
+            for package_id_value in ((applied_command or {}).get("package_ids") or []):
+                ref(f"tenants/{tenant_id}/packages/{package_id_value}").update({
+                    "ppp_profile_status": "synced",
+                    "ppp_profile_synced_at": iso_now(),
+                    "ppp_profile_error": None,
+                })
 
     return ok({"success": True, "acknowledged": updated})
 
@@ -2085,9 +2126,12 @@ def package_sync(request, package_id=None):
     should_queue = request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or bool(request.tenant.get("mikrotik_last_seen_at"))
     if should_queue:
         script = "".join(_package_profile_script(pkg) for pkg in packages_to_sync)
+        if any(package_service_type(pkg) == "hotspot" for pkg in packages_to_sync):
+            script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}) + script
         if not script:
             return ok({"message": "No valid package profiles to sync"}, 400)
-        response = _queue_router_command(request, {"type": "sync_packages", "script": script})
+        package_ids = [pkg.get("id") for pkg in packages_to_sync if pkg.get("id")]
+        response = _queue_router_command(request, {"type": "sync_packages", "script": script, "package_ids": package_ids})
         status_updates = {
             "ppp_profile_status": "queued",
             "ppp_profile_synced_at": "",
@@ -2114,7 +2158,9 @@ def package_sync(request, package_id=None):
             if request.tenant.get("mikrotik_last_seen_at"):
                 script = _package_profile_script(pkg)
                 if script:
-                    _queue_router_command(request, {"type": "sync_packages", "script": script})
+                    if package_service_type(pkg) == "hotspot":
+                        script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}) + script
+                    _queue_router_command(request, {"type": "sync_packages", "script": script, "package_ids": [pkg["id"]]})
                     ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "queued", "ppp_profile_error": None, "ppp_profile_queued_at": iso_now()})
                     results.append({"id": pkg["id"], "name": pkg.get("name"), "success": True, "queued": True})
                     continue
