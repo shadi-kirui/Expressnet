@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import socket
 import ssl
@@ -18,6 +19,8 @@ from firebase_admin import credentials, db as firebase_db
 
 from .models import AdminAuditLog, AdminUser, Customer, InternetPackage, Payment, SiteSettings, Tenant, Ticket
 
+
+_logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -1357,26 +1360,35 @@ def set_customer_enabled(tenant, username, service_type="hotspot", enabled=True)
                     tenant=tenant_obj, username=username
                 ).update(status="inactive")
             except Exception:
-                pass
+                _logger.exception("set_customer_enabled: failed updating Customer status to inactive for %s", username)
             if result.get("success"):
                 return result
             # If CoA failed, fall through to the direct API path
         except Exception:
-            pass  # Fall through to direct API path
+            _logger.exception("set_customer_enabled: RADIUS CoA disconnect failed for %s, falling back to direct API", username)
+            # Fall through to direct API path
 
     if tenant_radius_enabled and enabled:
         try:
-            from .models import Customer as CustomerModel
+            from .models import Tenant as TenantModel, Customer as CustomerModel
             tenant_obj = TenantModel.objects.get(pk=tenant_id) if isinstance(tenant, dict) else tenant
             CustomerModel.objects.filter(
                 tenant=tenant_obj, username=username
             ).update(status="active")
         except Exception:
-            pass
+            _logger.exception("set_customer_enabled: failed updating Customer status to active for %s", username)
 
-    if not has_mikrotik_credentials(tenant):
+    try:
+        if not has_mikrotik_credentials(tenant):
+            return None
+        api = router_connect(tenant)
+    except Exception:
+        # Network/connection errors talking to the router (or, transitively,
+        # to Firestore-backed tenant lookups) must never propagate and crash
+        # the caller/worker process.
+        _logger.exception("set_customer_enabled: failed to connect to router for tenant=%s username=%s", tenant_id, username)
         return None
-    api = router_connect(tenant)
+
     try:
         if service_type == "tv":
             path = ("ip", "hotspot", "ip-binding")
@@ -1398,11 +1410,17 @@ def set_customer_enabled(tenant, username, service_type="hotspot", enabled=True)
                 try:
                     api.path(*active_path).remove(active[".id"])
                 except Exception:
-                    pass
+                    _logger.exception("set_customer_enabled: failed to remove active session for %s", username)
 
         return result
+    except Exception:
+        _logger.exception("set_customer_enabled: router API call failed for tenant=%s username=%s", tenant_id, username)
+        return None
     finally:
-        api.close()
+        try:
+            api.close()
+        except Exception:
+            _logger.exception("set_customer_enabled: failed to close router API connection for tenant=%s", tenant_id)
 
 
 def delete_router_customer(tenant, username, service_type="pppoe"):
