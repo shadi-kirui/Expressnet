@@ -35,6 +35,7 @@ export default function CustomerPortal() {
   const [verifying, setVerifying] = useState(false);
   const [verification, setVerification] = useState(null);
   const [error, setError] = useState('');
+  const [routerContext, setRouterContext] = useState({ ip: '', mac: '' });
 
   useEffect(() => {
     const routeServiceType = pathServiceType();
@@ -60,13 +61,14 @@ export default function CustomerPortal() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+    const routerIp = params.get('ip');
+    const routerMac = params.get('mac');
+    setRouterContext({ ip: routerIp || '', mac: routerMac || '' });
     const reference = params.get('reference') || params.get('trxref');
     if (!reference) return;
     // Carried through by the router's hotspot login.html redirect (see
     // hotspot_login_redirect_html) so we know which trapped device to hand
     // the credentials back to after a successful payment.
-    const routerIp = params.get('ip');
-    const routerMac = params.get('mac');
     async function verify() {
       setVerifying(true);
       try {
@@ -78,8 +80,9 @@ export default function CustomerPortal() {
           // captive portal redirect), log the device straight in via
           // MikroTik's built-in login handler instead of leaving the
           // customer to read credentials off the screen and type them in.
-          if (routerIp && data.username && data.password) {
-            const loginUrl = `http://${routerIp}/login?username=${encodeURIComponent(data.username)}&password=${encodeURIComponent(data.password)}`;
+          const loginIp = routerIp || data.router_ip;
+          if (loginIp && data.username && data.password) {
+            const loginUrl = `http://${loginIp}/login?username=${encodeURIComponent(data.username)}&password=${encodeURIComponent(data.password)}`;
             window.location.href = loginUrl;
             return;
           }
@@ -160,6 +163,10 @@ export default function CustomerPortal() {
         service_type: serviceType,
         username: pppoeUsername,
         mac_address: macAddress,
+        ip: routerContext.ip,
+        mac: routerContext.mac,
+        router_ip: routerContext.ip,
+        router_mac: routerContext.mac,
       });
       toast.success(data.message || 'Redirecting to Paystack');
       if (data.authorizationUrl) {

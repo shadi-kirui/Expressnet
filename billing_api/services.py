@@ -352,6 +352,19 @@ def normalize_phone(phone):
     return digits
 
 
+def normalize_public_url(value):
+    value = str(value or "").strip().strip("\"'").rstrip("/")
+    while value.startswith("http://https://"):
+        value = "https://" + value[len("http://https://") :]
+    while value.startswith("https://http://"):
+        value = "http://" + value[len("https://http://") :]
+    if value.startswith("//"):
+        value = "https:" + value
+    if value and not value.startswith(("http://", "https://")):
+        value = "https://" + value
+    return value.rstrip("/")
+
+
 def get_public_base_url():
     candidates = [
         os.getenv("PUBLIC_APP_URL"),
@@ -362,7 +375,7 @@ def get_public_base_url():
     if not settings.DEBUG:
         candidates = [item for item in candidates if item and "localhost" not in item and "127.0.0.1" not in item]
     configured = next((item for item in candidates if item), "")
-    return (configured or "").rstrip("/")
+    return normalize_public_url(configured)
 
 
 def get_platform_paystack_secret():
@@ -787,8 +800,17 @@ def package_service_type(package):
 
 
 def captive_portal_url(tenant):
-    base = get_public_base_url().rstrip("/")
-    return f"{base}/api/captive/{tenant.get('id')}"
+    configured = (
+        os.getenv("CAPTIVE_PORTAL_PUBLIC_URL")
+        or (tenant or {}).get("captive_portal_public_url")
+        or os.getenv("SAAS_PORTAL_HOST")
+        or ""
+    )
+    base = normalize_public_url(configured) or get_public_base_url()
+    path = urlparse(base).path.rstrip("/")
+    if path.endswith("/portal"):
+        return f"{base}/{tenant.get('id')}"
+    return f"{base}/portal/{tenant.get('id')}"
 
 
 def captive_portal_host(tenant):
@@ -1193,8 +1215,8 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
     hotspot_setup = ""
     if portal_url:
         hotspot_setup = (
-            f':do {{ /ip hotspot profile add name="billing-saas-captive" login-by=http-pap,http-chap use-radius=no html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }} '
-            f'on-error={{ /ip hotspot profile set [find name="billing-saas-captive"] login-by=http-pap,http-chap use-radius=no html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }}; '
+            f':do {{ /ip hotspot profile add name="billing-saas-captive" login-by=http-pap,http-chap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }} '
+            f'on-error={{ /ip hotspot profile set [find name="billing-saas-captive"] login-by=http-pap,http-chap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }}; '
             f':do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
             f':do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
             f':do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
@@ -1242,16 +1264,16 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
 
 
 def upsert_customer_access(tenant, customer, disabled=False):
+    service_type = customer.get("service_type") or "pppoe"
     # When RADIUS is enabled, skip the RouterOS API call entirely.
     # The router will ask the RADIUS server at login time, so there is
     # nothing to push. The radius_secret is managed by sync_radius_customer.
     tenant_radius_enabled = tenant.get("radius_enabled") if isinstance(tenant, dict) else getattr(tenant, "radius_enabled", False)
-    if tenant_radius_enabled:
+    if tenant_radius_enabled and service_type != "pppoe":
         return {"skipped": True, "reason": "RADIUS enabled — auth handled by RADIUS server, no RouterOS API call needed"}
 
     if not has_mikrotik_credentials(tenant):
         return None
-    service_type = customer.get("service_type") or "pppoe"
     api = router_connect(tenant)
     try:
         if service_type == "tv":

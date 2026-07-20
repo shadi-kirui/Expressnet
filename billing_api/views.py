@@ -51,10 +51,13 @@ from .services import (
     firebase_backup_configured,
     list_children,
     mikrotik_managed_bridge_name,
+    normalize_public_url,
     normalize_phone,
+    normalize_rate_limit,
     package_service_type,
     PaymentProviderError,
     ref,
+    _rsc_escape,
     _get_jwt_secret,
     router_interface_status,
     router_items,
@@ -367,23 +370,11 @@ def react_asset(request, asset_path):
 
 
 def public_base_url(request):
-    def clean_url(value):
-        value = str(value or "").strip().strip("\"'").rstrip("/")
-        while value.startswith("http://https://"):
-            value = "https://" + value[len("http://https://") :]
-        while value.startswith("https://http://"):
-            value = "http://" + value[len("https://http://") :]
-        if value.startswith("//"):
-            value = "https:" + value
-        if value and not value.startswith(("http://", "https://")):
-            value = "https://" + value
-        return value.rstrip("/")
-
     host = request.get_host()
     if "://" in host:
         host = host.split("://", 1)[1]
     forwarded_proto = (request.META.get("HTTP_X_FORWARDED_PROTO") or request.scheme or "https").split(",")[0].strip()
-    request_url = clean_url(f"{forwarded_proto}://{host}")
+    request_url = normalize_public_url(f"{forwarded_proto}://{host}")
 
     candidates = [
         os.getenv("PUBLIC_APP_URL"),
@@ -396,7 +387,7 @@ def public_base_url(request):
     if not settings.DEBUG:
         candidates = [item for item in candidates if item and "localhost" not in item and "127.0.0.1" not in item]
     configured = next((item for item in candidates if item), "")
-    return clean_url(configured or request_url)
+    return normalize_public_url(configured or request_url)
 
 
 def tenant_theme_payload(tenant):
@@ -850,6 +841,8 @@ def public_redeem(request, tenant_id):
             "username": payment.get("access_username"),
             "password": payment.get("access_password"),
             "mac_address": payment.get("access_mac_address") or payment.get("mac_address"),
+            "router_ip": payment.get("router_ip"),
+            "router_mac": payment.get("router_mac"),
             "expires_at": payment.get("access_expires_at"),
         }
     )
@@ -885,6 +878,8 @@ def public_verify(request, tenant_id):
             "username": payment.get("access_username"),
             "password": payment.get("access_password"),
             "mac_address": payment.get("access_mac_address") or payment.get("mac_address"),
+            "router_ip": payment.get("router_ip"),
+            "router_mac": payment.get("router_mac"),
             "expires_at": payment.get("access_expires_at"),
             "paymentId": payment_id,
         }
@@ -948,16 +943,16 @@ def customer_add(request):
         pkg = find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", data["package_name"])
         if not pkg:
             return ok({"message": f"Package \"{data['package_name']}\" was not found"}, 404)
-        if service_type == "pppoe":
-            create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
-        else:
-            create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
         try:
+            if service_type == "pppoe":
+                create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
+            else:
+                create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
             upsert_customer_access(request.tenant, {**data, "service_type": service_type}, disabled=True)
         except (TimeoutError, OSError):
             _queue_router_command(request, {
                 "type": "sync_secrets",
-                "script": _customer_secret_script({**data, "service_type": service_type, "status": "inactive"}),
+                "script": _customer_secret_script({**data, "package": data["package_name"], "speed": pkg.get("speed"), "service_type": service_type, "status": "inactive"}),
             })
     new_ref = ref(f"tenants/{request.tenant['id']}/customers").push(
         {
@@ -1000,17 +995,17 @@ def customer_provision(request, customer_id):
         return ok({"message": "Configure MikroTik credentials before provisioning customers"}, 400)
     service_type = customer.get("service_type") or "pppoe"
     pkg = find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", customer.get("package"))
-    if pkg:
-        if service_type == "pppoe":
-            create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
-        elif service_type == "hotspot":
-            create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
     try:
+        if pkg:
+            if service_type == "pppoe":
+                create_ppp_profile(request.tenant, pkg["name"], pkg.get("speed"))
+            elif service_type == "hotspot":
+                create_hotspot_profile(request.tenant, pkg["name"], pkg.get("speed"))
         upsert_customer_access(request.tenant, {**customer, "package_name": customer.get("package"), "service_type": service_type}, disabled=customer.get("status") != "active")
     except (TimeoutError, OSError):
         _queue_router_command(request, {
             "type": "sync_secrets",
-            "script": _customer_secret_script({**customer, "package_name": customer.get("package"), "service_type": service_type}),
+            "script": _customer_secret_script({**customer, "package_name": customer.get("package"), "speed": (pkg or {}).get("speed"), "service_type": service_type}),
         })
     ref(f"tenants/{request.tenant['id']}/customers/{customer_id}").update(
         {"provisioning_status": "provisioned", "service_type": service_type, "auto_reconnect": True, "provisioning_message": f"{service_type.upper()} access synced on MikroTik", "provisioned_at": iso_now()}
@@ -1207,7 +1202,7 @@ def _queue_router_port_command(request, interface_name, service_type, profile_na
         return ok({"message": "Port service must be either pppoe or hotspot"}, 400)
 
     tenant_id = request.tenant["id"]
-    portal_url = f"{public_base_url(request).rstrip('/')}/api/captive/{tenant_id}" if service_type == "hotspot" else None
+    portal_url = captive_portal_url({"id": tenant_id, **request.tenant}) if service_type == "hotspot" else None
     bridge_name = mikrotik_managed_bridge_name(request.tenant)
     script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name)
 
@@ -1247,19 +1242,53 @@ def _queue_router_port_command(request, interface_name, service_type, profile_na
 def _customer_secret_script(customer):
     """Generate an .rsc snippet that upserts a single customer into /ppp secret or /ip hotspot user."""
     service_type = customer.get("service_type") or "pppoe"
+    if service_type not in {"pppoe", "hotspot"}:
+        service_type = "pppoe"
     username = _rsc_escape(customer.get("username") or "")
     password = _rsc_escape(customer.get("password") or "")
-    profile = _rsc_escape(customer.get("package") or customer.get("package_name") or "")
+    profile = _rsc_escape(customer.get("package") or customer.get("package_name") or "default")
+    if not username:
+        return ""
     disabled = "no" if customer.get("status") == "active" else "yes"
+    rate_limit = _rsc_escape(normalize_rate_limit(customer.get("speed")) or "")
+    rate_limit_field = f' rate-limit="{rate_limit}"' if rate_limit else ""
+    ppp_profile_script = (
+        f':if ("{profile}" != "default") do={{ '
+        f':if ([:len [/ppp profile find name="{profile}"]] = 0) do={{'
+        f' /ppp profile add name="{profile}"{rate_limit_field} }} '
+        f'else={{ /ppp profile set [find name="{profile}"]{rate_limit_field} }}; }};'
+        if rate_limit
+        else (
+            f':if ("{profile}" != "default") do={{ '
+            f':if ([:len [/ppp profile find name="{profile}"]] = 0) do={{'
+            f' /ppp profile add name="{profile}" }}; }};'
+        )
+    )
+    hotspot_profile_script = (
+        f':if ("{profile}" != "default") do={{ '
+        f':if ([:len [/ip hotspot user profile find name="{profile}"]] = 0) do={{'
+        f' /ip hotspot user profile add name="{profile}"{rate_limit_field} }} '
+        f'else={{ /ip hotspot user profile set [find name="{profile}"]{rate_limit_field} }}; }};'
+        if rate_limit
+        else (
+            f':if ("{profile}" != "default") do={{ '
+            f':if ([:len [/ip hotspot user profile find name="{profile}"]] = 0) do={{'
+            f' /ip hotspot user profile add name="{profile}" }}; }};'
+        )
+    )
     if service_type == "pppoe":
         return (
+            ppp_profile_script
+            +
             f':if ([:len [/ppp secret find name="{username}"]] = 0) do={{'
             f' /ppp secret add name="{username}" password="{password}" service=pppoe '
             f'profile="{profile}" disabled={disabled} comment="billing-saas-managed" }} '
             f'else={{ /ppp secret set [find name="{username}"] password="{password}" '
-            f'profile="{profile}" disabled={disabled} comment="billing-saas-managed" }};'
+            f'service=pppoe profile="{profile}" disabled={disabled} comment="billing-saas-managed" }};'
         )
     return (
+        hotspot_profile_script
+        +
         f':if ([:len [/ip hotspot user find name="{username}"]] = 0) do={{'
         f' /ip hotspot user add name="{username}" password="{password}" '
         f'profile="{profile}" disabled={disabled} comment="billing-saas-managed" }} '
@@ -1272,6 +1301,15 @@ def _queue_all_customer_secrets(request):
     """Queue a sync-secrets command that pushes every existing customer to the router."""
     tenant_id = request.tenant["id"]
     customers = list_children(f"tenants/{tenant_id}/customers")
+    packages = {
+        str(package.get("name") or ""): package
+        for package in list_children(f"tenants/{tenant_id}/packages")
+        if package.get("name")
+    }
+    customers = [
+        {**customer, "speed": (packages.get(str(customer.get("package") or "")) or {}).get("speed")}
+        for customer in customers
+    ]
     script = "".join(_customer_secret_script(c) for c in customers)
     if script:
         _queue_router_command(request, {"type": "sync_secrets", "script": script})
@@ -1497,24 +1535,19 @@ def router_provision_script(request, token):
         return HttpResponse("Not Found: Tenant account profile was not located.", status=404, content_type="text/plain")
 
     tenant = {"id": tenant_id, **tenant_data}
-    configured_portal_url = (
-        os.getenv("CAPTIVE_PORTAL_PUBLIC_URL")
-        or tenant.get("captive_portal_public_url")
-        or ""
-    ).strip().rstrip("/")
-    base_url = configured_portal_url or public_base_url(request).rstrip("/")
-    portal_url = f"{base_url}/api/captive/{tenant_id}"
-    portal_host = urlparse(base_url).netloc.split("@")[-1].split(":")[0]
-    callback_base_url = f"{base_url}/api/router/provision/{token}/complete"
-    snapshot_url = f"{base_url}/api/router/provision/{token}/snapshot"
-    snapshot_interface_url = f"{base_url}/api/router/provision/{token}/snapshot/interface"
-    snapshot_pppoe_profile_url = f"{base_url}/api/router/provision/{token}/snapshot/pppoe-profile"
-    snapshot_hotspot_profile_url = f"{base_url}/api/router/provision/{token}/snapshot/hotspot-profile"
-    snapshot_pppoe_server_url = f"{base_url}/api/router/provision/{token}/snapshot/pppoe-server"
-    snapshot_hotspot_server_url = f"{base_url}/api/router/provision/{token}/snapshot/hotspot-server"
+    app_base_url = public_base_url(request).rstrip("/")
+    portal_url = captive_portal_url(tenant)
+    portal_host = urlparse(portal_url).netloc.split("@")[-1].split(":")[0]
+    callback_base_url = f"{app_base_url}/api/router/provision/{token}/complete"
+    snapshot_url = f"{app_base_url}/api/router/provision/{token}/snapshot"
+    snapshot_interface_url = f"{app_base_url}/api/router/provision/{token}/snapshot/interface"
+    snapshot_pppoe_profile_url = f"{app_base_url}/api/router/provision/{token}/snapshot/pppoe-profile"
+    snapshot_hotspot_profile_url = f"{app_base_url}/api/router/provision/{token}/snapshot/hotspot-profile"
+    snapshot_pppoe_server_url = f"{app_base_url}/api/router/provision/{token}/snapshot/pppoe-server"
+    snapshot_hotspot_server_url = f"{app_base_url}/api/router/provision/{token}/snapshot/hotspot-server"
 
     agent_token = jwt.encode({"purpose": "mikrotik_agent", "tenant_id": tenant_id}, _get_jwt_secret("JWT_SECRET"), algorithm="HS256")
-    agent_poll_url = f"{base_url}/api/router/agent/{agent_token}/poll"
+    agent_poll_url = f"{app_base_url}/api/router/agent/{agent_token}/poll"
 
     def _rsc_escape(value):
         return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
@@ -1672,7 +1705,7 @@ def router_provision_script(request, token):
         :do {{ /ip firewall filter add chain=input in-interface=wg-saas protocol=udp dst-port=1812,1813,3799 action=accept comment="billing-saas allow radius" }} on-error={{ :log warning "Billing SaaS: RADIUS firewall rule failed" }}
         :foreach s in=[/ppp secret find] do={{ :if ([/ppp secret get $s comment] != "billing-saas-managed") do={{ :do {{ /ppp secret remove $s }} on-error={{}} }} }}
         :log info "Billing SaaS: configuring captive portal (empty page until a port is assigned)";
-        :do {{ /ip hotspot profile add name=billing-saas-captive hotspot-address={_rsc_escape(lan_gateway)} dns-name="{_rsc_escape(hotspot_dns_name)}" login-by=http-chap,http-pap use-radius=no html-directory=hotspot }} on-error={{ /ip hotspot profile set [find name=billing-saas-captive] hotspot-address={_rsc_escape(lan_gateway)} dns-name="{_rsc_escape(hotspot_dns_name)}" login-by=http-chap,http-pap use-radius=no html-directory=hotspot }}
+        :do {{ /ip hotspot profile add name=billing-saas-captive hotspot-address={_rsc_escape(lan_gateway)} dns-name="{_rsc_escape(hotspot_dns_name)}" login-by=http-chap,http-pap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot }} on-error={{ /ip hotspot profile set [find name=billing-saas-captive] hotspot-address={_rsc_escape(lan_gateway)} dns-name="{_rsc_escape(hotspot_dns_name)}" login-by=http-chap,http-pap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot }}
         :do {{ /ip hotspot user profile add name=billing-saas-unpaid shared-users=1 keepalive-timeout=2m status-autorefresh=1m }} on-error={{}}
         :foreach h in=[/ip hotspot find] do={{
             :local hn [/ip hotspot get $h name];
@@ -1755,9 +1788,8 @@ def router_agent_poll(request, token):
     all_commands = tenant.get("pending_router_commands") or []
     commands = [c for c in all_commands if c.get("status") == "pending"]
     base_url = public_base_url(request).rstrip("/")
-    snapshot_script = _router_snapshot_fetch_script(f"{base_url}/api/router/provision/{token}/snapshot")
     if not commands:
-        return HttpResponse(':log info "Billing SaaS agent: refreshing router snapshot";\n' + snapshot_script + '\n:log info "Billing SaaS agent: no pending commands";\n', content_type="text/plain")
+        return HttpResponse(':log info "Billing SaaS agent: no pending commands";\n', content_type="text/plain")
 
     lines = [':log info "Billing SaaS agent: applying queued commands";']
     delivered_at = iso_now()
@@ -2823,7 +2855,7 @@ def paystack_callback(request):
     if verified.get("status") == "success":
         complete_paystack_payment(verified)
         if "text/html" in request.headers.get("accept", ""):
-            return redirect(f"/api/captive/{tenant_id}?reference={reference}")
+            return redirect(f"/portal/{tenant_id}?reference={reference}")
         return ok({"success": True, "message": "Payment verified. You can return to the customer portal.", "paymentId": payment_id})
     ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"status": "failed", "callback_result_desc": verified.get("gateway_response") or "Paystack verification did not succeed", "failed_at": iso_now()})
     return ok({"success": False, "message": "Payment was not successful"}, 400)
