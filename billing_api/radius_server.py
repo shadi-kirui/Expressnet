@@ -14,7 +14,7 @@ import socket
 import struct
 import threading
 import time
-from datetime import timedelta
+from datetime import timedelta,timezone
 
 from django.conf import settings
 import pyrad.packet

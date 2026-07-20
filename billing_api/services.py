@@ -944,7 +944,16 @@ def routeros_hotspot_fetch_script(portal_url, log_prefix="Billing SaaS"):
     separator = "&" if "?" in template_base else "?"
     skip_warning = "ngrok-skip-browser-warning=true" if urlparse(str(portal_url or "")).netloc.lower().endswith("ngrok-free.dev") else ""
     pages = ["login.html", "alogin.html", "redirect.html", "error.html", "status.html", "rlogin.html", "radvert.html"]
-    parts = []
+    # /tool fetch will NOT create missing directories -- it silently fails
+    # (caught below by on-error) if "hotspot" or "flash/hotspot" don't
+    # already exist. Make sure both directories are present first, so the
+    # captive-portal page fetches below actually land on disk.
+    parts = [
+        f':do {{ :if ([:len [/file find name="hotspot" type=directory]] = 0) do={{ /file add name="hotspot" type=directory }} }} '
+        f'on-error={{ :log warning "{log_prefix}: failed to create hotspot directory" }};',
+        f':do {{ :if ([:len [/file find name="flash/hotspot" type=directory]] = 0) do={{ /file add name="flash/hotspot" type=directory }} }} '
+        f'on-error={{ :log warning "{log_prefix}: failed to create flash/hotspot directory" }};',
+    ]
     for page in pages:
         src_url = f"{template_base}/{page}"
         if skip_warning:
