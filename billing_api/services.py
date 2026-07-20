@@ -800,6 +800,7 @@ def package_service_type(package):
 
 
 def captive_portal_url(tenant):
+    tenant_id = (tenant or {}).get("id")
     configured = (
         os.getenv("CAPTIVE_PORTAL_PUBLIC_URL")
         or (tenant or {}).get("captive_portal_public_url")
@@ -808,9 +809,13 @@ def captive_portal_url(tenant):
     )
     base = normalize_public_url(configured) or get_public_base_url()
     path = urlparse(base).path.rstrip("/")
-    if path.endswith("/portal"):
-        return f"{base}/{tenant.get('id')}"
-    return f"{base}/portal/{tenant.get('id')}"
+    if "{tenant_id}" in base:
+        return base.replace("{tenant_id}", str(tenant_id))
+    if path.endswith(("/api/captive", "/portal")):
+        return f"{base}/{tenant_id}"
+    if f"/api/captive/{tenant_id}" in path or f"/portal/{tenant_id}" in path:
+        return base
+    return f"{base}/api/captive/{tenant_id}"
 
 
 def captive_portal_host(tenant):
@@ -847,6 +852,7 @@ def hotspot_login_redirect_html(portal_url):
         "<!doctype html><html><head>"
         "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<meta http-equiv='refresh' content='0; url={target}'>"
         "<title>Internet Access</title>"
         "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
         "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:12px 16px;border-radius:6px;font-weight:700}</style>"
@@ -854,6 +860,7 @@ def hotspot_login_redirect_html(portal_url):
         "<h3>Internet Packages</h3>"
         "<p>Select a package and pay to continue browsing.</p>"
         f"<a href='{target}'>Open packages</a>"
+        f"<script>window.location.replace('{target}');</script>"
         "</body></html>"
     )
 
@@ -864,6 +871,7 @@ def hotspot_error_redirect_html(portal_url):
         "<!doctype html><html><head>"
         "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<meta http-equiv='refresh' content='0; url={target}'>"
         "<title>Internet Access</title>"
         "<style>body{font-family:Arial,sans-serif;background:#f3f6fb;color:#0f172a;text-align:center;padding:24px}"
         "a{display:inline-block;background:#f97316;color:white;text-decoration:none;padding:11px 14px;border-radius:6px;font-weight:700}</style>"
@@ -871,6 +879,7 @@ def hotspot_error_redirect_html(portal_url):
         "<h3>Return to Internet Packages</h3>"
         "<p>Your session needs a package before internet access can continue.</p>"
         f"<a href='{target}'>Open packages</a>"
+        f"<script>window.location.replace('{target}');</script>"
         "</body></html>"
     )
 

@@ -91,6 +91,8 @@ SENSITIVE_FIELDS = {"password", "mikrotik_pass", "paystack_secret_key"}
 
 def body(request):
     if hasattr(request, "data"):
+        if hasattr(request.data, "dict"):
+            return request.data.dict()
         return request.data if isinstance(request.data, dict) else dict(request.data)
     if not request.body:
         return {}
@@ -575,28 +577,31 @@ def public_packages(request, tenant_id):
     if tenant.get("status") == "suspended":
         return ok({"message": "Tenant is not accepting payments"}, 403)
     requested_service = str(request.GET.get("service_type") or "").strip().lower()
-    packages = [
-        {
-            **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "service_type"]},
-            "service_type": package_service_type(pkg),
-            "duration_label": package_duration_label(pkg),
-        }
-        for pkg in list_children(f"tenants/{tenant_id}/packages")
-        if pkg.get("is_active") is not False and (requested_service not in {"hotspot", "pppoe"} or package_service_type(pkg) == requested_service)
-    ]
+    packages = _public_packages_for_tenant(tenant_id, requested_service)
     return ok(sorted(packages, key=lambda item: float(item.get("price") or 0)))
 
 
-def _captive_packages(tenant_id):
+def _public_package_payload(pkg):
+    return {
+        **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "service_type"]},
+        "service_type": package_service_type(pkg),
+        "duration_label": package_duration_label(pkg),
+    }
+
+
+def _public_packages_for_tenant(tenant_id, requested_service=""):
     return [
-        {
-            **{key: pkg.get(key) for key in ["id", "name", "speed", "duration_days", "duration_unit", "duration_value", "duration_hours", "price", "service_type"]},
-            "service_type": package_service_type(pkg),
-            "duration_label": package_duration_label(pkg),
-        }
+        _public_package_payload(pkg)
         for pkg in list_children(f"tenants/{tenant_id}/packages")
-        if pkg.get("is_active") is not False and package_service_type(pkg) == "hotspot"
+        if pkg.get("is_active") is not False and (requested_service not in {"hotspot", "pppoe"} or package_service_type(pkg) == requested_service)
     ]
+
+
+def _captive_packages(tenant_id):
+    hotspot_packages = _public_packages_for_tenant(tenant_id, "hotspot")
+    if hotspot_packages:
+        return hotspot_packages
+    return _public_packages_for_tenant(tenant_id)
 
 
 def _html_page(title, body, status=200):
@@ -670,19 +675,25 @@ def captive_portal_page(request, tenant_id):
             f"""
             <form class="card pkg" method="post" action="/api/captive/{html.escape(str(tenant_id))}/pay">
               <input type="hidden" name="package_id" value="{html.escape(str(pkg.get('id')))}">
+              <input type="hidden" name="service_type" value="{html.escape(str(pkg.get('service_type') or 'hotspot'))}">
               {hidden}
               <div>
                 <strong>{html.escape(str(pkg.get('name') or 'Package'))}</strong>
                 <div class="muted">{html.escape(str(pkg.get('speed') or ''))} · {html.escape(str(pkg.get('duration_label') or ''))}</div>
               </div>
               <div class="price">KES {html.escape(str(pkg.get('price') or 0))}</div>
+              {('<input name="username" required placeholder="PPPoE username">' if pkg.get('service_type') == 'pppoe' else '')}
               <input name="phone" inputmode="tel" required placeholder="M-Pesa/phone number">
               <button type="submit">Buy</button>
             </form>"""
             for pkg in packages
         )
     else:
-        package_html = "<div class='alert'>No active hotspot packages are available. Please contact the provider.</div>"
+        total_packages = len(list_children(f"tenants/{tenant_id}/packages"))
+        if total_packages:
+            package_html = "<div class='alert'>Packages exist, but none are active. Please contact the provider.</div>"
+        else:
+            package_html = "<div class='alert'>No packages are configured yet. Please contact the provider.</div>"
 
     body_html = f"""
       <header><h1>{html.escape(str(tenant.get('business_name') or 'Internet packages'))}</h1><p>Choose a package and pay to access the internet.</p></header>
