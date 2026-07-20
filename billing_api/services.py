@@ -900,7 +900,21 @@ def hotspot_alogin_redirect_html(portal_url):
     )
 
 
-def hotspot_redirect_html():
+def hotspot_redirect_html(portal_url=None):
+    if portal_url:
+        target = hotspot_portal_target(portal_url, "ip=$(ip)&mac=$(mac)&error=$(error)")
+        return (
+            "<!doctype html><html><head>"
+            "<meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            f"<meta http-equiv='refresh' content='0; url={target}'>"
+            "<title>Internet Packages</title>"
+            "</head><body>"
+            "<p style='font-family:Arial,sans-serif;text-align:center;padding:20px'>Opening packages...</p>"
+            f"<script>window.location.replace('{target}');</script>"
+            f"<noscript><p style='text-align:center'><a href='{target}'>Open packages</a></p></noscript>"
+            "</body></html>"
+        )
     return (
         "<!doctype html><html><head>"
         "<meta charset='utf-8'>"
@@ -940,7 +954,7 @@ def ensure_hotspot_login_redirect(api, portal_url):
     files_to_push = {
         "hotspot/login.html": hotspot_login_redirect_html(portal_url),
         "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-        "hotspot/redirect.html": hotspot_redirect_html(),
+        "hotspot/redirect.html": hotspot_redirect_html(portal_url),
         "hotspot/error.html": hotspot_error_redirect_html(portal_url),
         "hotspot/status.html": "<html><body>Processing...</body></html>",
         "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
@@ -1217,7 +1231,7 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
             {
                 "hotspot/login.html": hotspot_login_redirect_html(portal_url),
                 "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-                "hotspot/redirect.html": hotspot_redirect_html(),
+                "hotspot/redirect.html": hotspot_redirect_html(portal_url),
                 "hotspot/error.html": hotspot_error_redirect_html(portal_url),
                 "hotspot/status.html": "<html><body>Processing...</body></html>",
                 "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",

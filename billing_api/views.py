@@ -1078,11 +1078,18 @@ def packages(request, package_id=None):
             return ok({"message": "Package not found"}, 404)
         router_updates = {"updated_at": iso_now()}
         if has_mikrotik_credentials(request.tenant):
-            try:
-                sync_package_profile(request.tenant, {**existing, **updates})
-                router_updates.update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
-            except Exception as exc:
-                router_updates.update({"ppp_profile_status": "failed", "ppp_profile_error": str(exc)})
+            package_for_router = {"id": package_id, **existing, **updates}
+            if request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or request.tenant.get("mikrotik_last_seen_at"):
+                script = _package_profile_script(package_for_router)
+                if script:
+                    _queue_router_command(request, {"type": "sync_packages", "script": script})
+                    router_updates.update({"ppp_profile_status": "queued", "ppp_profile_queued_at": iso_now(), "ppp_profile_error": None})
+            else:
+                try:
+                    sync_package_profile(request.tenant, package_for_router)
+                    router_updates.update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
+                except Exception as exc:
+                    router_updates.update({"ppp_profile_status": "failed", "ppp_profile_error": str(exc)})
         else:
             router_updates.update({"ppp_profile_status": "pending"})
         ref(f"tenants/{tenant_id}/packages/{package_id}").update({**updates, **router_updates})
@@ -1104,13 +1111,17 @@ def package_add(request):
     if find_child_by_field(f"tenants/{request.tenant['id']}/packages", "name", data["name"]):
         return ok({"message": "A package with this name already exists"}, 409)
     router_synced = False
+    router_queued = False
     router_error = None
     if has_mikrotik_credentials(request.tenant):
-        try:
-            sync_package_profile(request.tenant, {**data, **package_payload})
-            router_synced = True
-        except Exception as exc:
-            router_error = str(exc)
+        if request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or request.tenant.get("mikrotik_last_seen_at"):
+            router_queued = True
+        else:
+            try:
+                sync_package_profile(request.tenant, {**data, **package_payload})
+                router_synced = True
+            except Exception as exc:
+                router_error = str(exc)
     new_ref = ref(f"tenants/{request.tenant['id']}/packages").push(
         {
             "name": data["name"],
@@ -1118,13 +1129,16 @@ def package_add(request):
             **package_payload,
             "price": float(data["price"]),
             "is_active": data.get("is_active") is not False,
-            "ppp_profile_status": "synced" if router_synced else "pending",
+            "ppp_profile_status": "synced" if router_synced else "queued" if router_queued else "pending",
             "ppp_profile_synced_at": iso_now() if router_synced else "",
+            "ppp_profile_queued_at": iso_now() if router_queued else "",
             "ppp_profile_error": router_error,
             "created_at": iso_now(),
         }
     )
-    message = "Package and MikroTik profile created" if router_synced else "Package created. Sync router after MikroTik is connected."
+    if router_queued:
+        _queue_router_command(request, {"type": "sync_packages", "script": _package_profile_script({"id": new_ref.key, **data, **package_payload})})
+    message = "Package and MikroTik profile created" if router_synced else "Package created and queued for MikroTik sync" if router_queued else "Package created. Sync router after MikroTik is connected."
     return ok({"success": True, "message": message, "packageId": new_ref.key}, 201)
 
 
@@ -1306,6 +1320,27 @@ def _customer_secret_script(customer):
         f'profile="{profile}" disabled={disabled} comment="billing-saas-managed" }} '
         f'else={{ /ip hotspot user set [find name="{username}"] password="{password}" '
         f'profile="{profile}" disabled={disabled} comment="billing-saas-managed" }};'
+    )
+
+
+def _package_profile_script(package):
+    """Generate an .rsc snippet that upserts one PPPoE or Hotspot package profile."""
+    name = _rsc_escape(package.get("name") or "")
+    if not name:
+        return ""
+    service_type = package_service_type(package)
+    rate_limit = _rsc_escape(normalize_rate_limit(package.get("speed")) or "")
+    rate_limit_field = f' rate-limit="{rate_limit}"' if rate_limit else ""
+    if service_type == "pppoe":
+        return (
+            f':if ([:len [/ppp profile find name="{name}"]] = 0) do={{'
+            f' /ppp profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
+            f'else={{ /ppp profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }};'
+        )
+    return (
+        f':if ([:len [/ip hotspot user profile find name="{name}"]] = 0) do={{'
+        f' /ip hotspot user profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
+        f'else={{ /ip hotspot user profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }};'
     )
 
 
@@ -1568,7 +1603,7 @@ def router_provision_script(request, token):
         {
             "hotspot/login.html": hotspot_login_redirect_html(portal_url),
             "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
-            "hotspot/redirect.html": hotspot_redirect_html(),
+            "hotspot/redirect.html": hotspot_redirect_html(portal_url),
             "hotspot/error.html": hotspot_error_redirect_html(portal_url),
             "hotspot/status.html": "<html><body>Processing...</body></html>",
             "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
@@ -2047,6 +2082,28 @@ def package_sync(request, package_id=None):
     packages_to_sync = list_children(f"tenants/{tenant_id}/packages") if package_id is None else [{"id": package_id, **(ref(f"tenants/{tenant_id}/packages/{package_id}").get() or {})}]
     if package_id and not packages_to_sync[0].get("name"):
         return ok({"message": "Package not found"}, 404)
+    should_queue = request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or bool(request.tenant.get("mikrotik_last_seen_at"))
+    if should_queue:
+        script = "".join(_package_profile_script(pkg) for pkg in packages_to_sync)
+        if not script:
+            return ok({"message": "No valid package profiles to sync"}, 400)
+        response = _queue_router_command(request, {"type": "sync_packages", "script": script})
+        status_updates = {
+            "ppp_profile_status": "queued",
+            "ppp_profile_synced_at": "",
+            "ppp_profile_error": None,
+            "ppp_profile_queued_at": iso_now(),
+        }
+        for pkg in packages_to_sync:
+            if pkg.get("id"):
+                ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update(status_updates)
+        payload = getattr(response, "data", {}) or {}
+        payload.update({
+            "message": "Package profile sync queued and will be applied on next router poll (usually within 30s).",
+            "queued": True,
+            "count": len(packages_to_sync),
+        })
+        return ok(payload)
     results = []
     for pkg in packages_to_sync:
         try:
@@ -2054,10 +2111,18 @@ def package_sync(request, package_id=None):
             ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
             results.append({"id": pkg["id"], "name": pkg["name"], "success": True})
         except Exception as exc:
+            if request.tenant.get("mikrotik_last_seen_at"):
+                script = _package_profile_script(pkg)
+                if script:
+                    _queue_router_command(request, {"type": "sync_packages", "script": script})
+                    ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "queued", "ppp_profile_error": None, "ppp_profile_queued_at": iso_now()})
+                    results.append({"id": pkg["id"], "name": pkg.get("name"), "success": True, "queued": True})
+                    continue
             ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "failed", "ppp_profile_error": str(exc), "ppp_profile_failed_at": iso_now()})
             results.append({"id": pkg["id"], "name": pkg.get("name"), "success": False, "message": str(exc)})
     if package_id:
-        return ok({"success": True, "message": "MikroTik package profile synced"})
+        result = results[0] if results else {}
+        return ok({"success": bool(result.get("success")), "queued": bool(result.get("queued")), "message": "Package profile sync queued" if result.get("queued") else "MikroTik package profile synced" if result.get("success") else result.get("message", "Package profile sync failed")}, 200 if result.get("success") else 400)
     synced = len([r for r in results if r["success"]])
     failed = len(results) - synced
     return ok({"success": failed == 0, "message": "All package profiles synced" if failed == 0 else f"{synced} package profiles synced, {failed} failed", "synced": synced, "failed": failed, "results": results})
