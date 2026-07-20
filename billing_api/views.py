@@ -46,6 +46,7 @@ from .services import (
     hotspot_error_redirect_html,
     hotspot_login_redirect_html,
     hotspot_redirect_html,
+    routeros_hotspot_file_script,
     initiate_paystack_payment,
     iso_now,
     firebase_backup_configured,
@@ -1552,10 +1553,17 @@ def router_provision_script(request, token):
     def _rsc_escape(value):
         return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
-    login_html = _rsc_escape(hotspot_login_redirect_html(portal_url))
-    alogin_html = _rsc_escape(hotspot_alogin_redirect_html(portal_url))
-    redirect_html = _rsc_escape(hotspot_redirect_html())
-    error_html = _rsc_escape(hotspot_error_redirect_html(portal_url))
+    hotspot_file_script = routeros_hotspot_file_script(
+        {
+            "hotspot/login.html": hotspot_login_redirect_html(portal_url),
+            "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
+            "hotspot/redirect.html": hotspot_redirect_html(),
+            "hotspot/error.html": hotspot_error_redirect_html(portal_url),
+            "hotspot/status.html": "<html><body>Processing...</body></html>",
+            "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
+            "hotspot/radvert.html": "<html><body></body></html>",
+        }
+    )
     snapshot_script = _router_snapshot_fetch_script(snapshot_url)
 
     wg_server_public_key = str(os.getenv("WG_SERVER_PUBLIC_KEY") or tenant.get("wg_server_public_key") or "").strip()
@@ -1727,21 +1735,7 @@ def router_provision_script(request, token):
             :do {{ /ip hotspot walled-garden ip add action=accept dst-address=$billingPortalIp protocol=tcp dst-port=80 comment="billing-saas captive portal access" }} on-error={{}}
             :do {{ /ip hotspot walled-garden ip add action=accept dst-address=$billingPortalIp protocol=tcp dst-port=443 comment="billing-saas captive portal access" }} on-error={{}}
         }}
-        :local billingLogin "{login_html}";
-        :do {{ /file set [find name="hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="hotspot/login.html" contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/login.html" }} }}
-        :do {{ /file set [find name="flash/hotspot/login.html"] contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/login.html" }}
-        :local billingAlogin "{alogin_html}";
-        :do {{ /file set [find name="hotspot/alogin.html"] contents=$billingAlogin }} on-error={{ :do {{ /file add name="hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/alogin.html" }} }}
-        :do {{ /file set [find name="flash/hotspot/alogin.html"] contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/alogin.html" }}
-        :local billingRedirect "{redirect_html}";
-        :do {{ /file set [find name="hotspot/redirect.html"] contents=$billingRedirect }} on-error={{ :do {{ /file add name="hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/redirect.html" }} }}
-        :do {{ /file set [find name="flash/hotspot/redirect.html"] contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/redirect.html" }}
-        :local billingError "{error_html}";
-        :do {{ /file set [find name="hotspot/error.html"] contents=$billingError }} on-error={{ :do {{ /file add name="hotspot/error.html" contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/error.html" }} }}
-        :do {{ /file set [find name="flash/hotspot/error.html"] contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/error.html" }}
-        :do {{ /file add name="hotspot/status.html" contents="<html><body>Processing...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/status.html" }}
-        :do {{ /file add name="hotspot/rlogin.html" contents="<html><body>Redirecting...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/rlogin.html" }}
-        :do {{ /file add name="hotspot/radvert.html" contents="<html><body></body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/radvert.html" }}
+        {hotspot_file_script}
         :local billingHsFileCount [:len [/file find name~"hotspot"]];
         :do {{ /tool fetch keep-result=no url=("{snapshot_url}/hotspot-files-check?count=" . $billingHsFileCount) }} on-error={{ :log warning "Billing SaaS: hotspot file count report failed" }}
         {interface_report_loop}
@@ -2747,6 +2741,26 @@ def activate_paid_access(tenant, payment_id, payment, phone, payment_code):
         create_ppp_profile(tenant, pkg["name"], pkg.get("speed"))
     if service_type == "tv" and not mac_address:
         raise ValueError("TV MAC address is required for activation")
+    if tenant.get("radius_enabled") and service_type in {"hotspot", "pppoe"}:
+        try:
+            from .radius_provisioning import sync_radius_customer, upsert_pg_customer
+
+            tenant_obj = Tenant.objects.get(pk=tenant_id)
+            upsert_pg_customer(
+                tenant_obj,
+                {
+                    "name": (customer or {}).get("name") or phone or username,
+                    "phone": phone,
+                    "username": username,
+                    "password": password,
+                    "package": package_for_access,
+                    "service_type": service_type,
+                    "status": "active",
+                },
+            )
+            sync_radius_customer(tenant_obj, {"username": username, "password": password})
+        except Exception:
+            pass
     upsert_customer_access(tenant, {"username": username, "password": password, "package_name": package_for_access, "service_type": service_type, "mac_address": mac_address})
     set_customer_enabled(tenant, username, service_type, True)
     ref(f"tenants/{tenant_id}/payments/{payment_id}").update({"customer_id": customer_id, "access_username": username, "access_password": password, "access_mac_address": mac_address, "access_expires_at": expiry.isoformat(), "access_status": "active", "auto_reconnect": True})

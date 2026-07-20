@@ -113,10 +113,12 @@ def sync_radius_customer(tenant_obj, customer_data):
     if not username:
         return {"synced": False, "message": "No username provided"}
 
-    # Set the radius_secret if not already set, or if the password changed
+    # Set the radius_secret if not already set, or if the password changed.
     update_fields = []
-    if not customer.radius_secret:
-        # Generate a random secret if none exists, or use the provided password
+    if password and customer.radius_secret != password:
+        customer.radius_secret = password
+        update_fields.append("radius_secret")
+    elif not customer.radius_secret:
         customer.radius_secret = password or secrets.token_urlsafe(16)
         update_fields.append("radius_secret")
 

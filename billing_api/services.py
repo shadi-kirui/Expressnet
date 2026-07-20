@@ -905,12 +905,37 @@ def hotspot_redirect_html():
     )
 
 
+def routeros_hotspot_file_script(files, log_prefix="Billing SaaS"):
+    parts = [
+        ':do { /file add name="hotspot" type=directory } on-error={};',
+        ':do { /file add name="flash/hotspot" type=directory } on-error={};',
+    ]
+    for index, (name, contents) in enumerate(files.items()):
+        var_name = f"billingHotspotFile{index}"
+        escaped_contents = _rsc_escape(contents)
+        for target_name in (name, f"flash/{name}"):
+            parts.append(
+                f':local {var_name} "{escaped_contents}"; '
+                f':local {var_name}Id [/file find name="{target_name}"]; '
+                f':if ([:len ${var_name}Id] > 0) do={{ '
+                f'/file set ${var_name}Id contents=${var_name} '
+                f'}} else={{ '
+                f':do {{ /file add name="{target_name}" contents=${var_name} }} '
+                f'on-error={{ :log warning "{log_prefix}: failed to write {target_name}" }} '
+                f'}};'
+            )
+    return " ".join(parts)
+
+
 def ensure_hotspot_login_redirect(api, portal_url):
     files_to_push = {
         "hotspot/login.html": hotspot_login_redirect_html(portal_url),
         "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
         "hotspot/redirect.html": hotspot_redirect_html(),
         "hotspot/error.html": hotspot_error_redirect_html(portal_url),
+        "hotspot/status.html": "<html><body>Processing...</body></html>",
+        "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
+        "hotspot/radvert.html": "<html><body></body></html>",
     }
     existing_files = list(api.path("file").select())
     pushed = {}
@@ -1175,31 +1200,20 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
     bridge_name = bridge_name or mikrotik_managed_bridge_name()
     portal_comment = portal_url or ""
     portal_host = urlparse(portal_url or "").netloc.split("@")[-1].split(":")[0]
-    login_html = _rsc_escape(hotspot_login_redirect_html(portal_url)) if portal_url else ""
-    alogin_html = _rsc_escape(hotspot_alogin_redirect_html(portal_url)) if portal_url else ""
-    redirect_html = _rsc_escape(hotspot_redirect_html())
-    error_html = _rsc_escape(hotspot_error_redirect_html(portal_url)) if portal_url else ""
 
     # --- Hotspot file writes with LOGGED errors and verification ---
     hotspot_file_writes = ""
     if portal_url:
-        hotspot_file_writes = (
-            f':local billingLogin "{login_html}"; '
-            f':do {{ /file set [find name="hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="hotspot/login.html" contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/login.html" }} }}; '
-            f':do {{ /file set [find name="flash/hotspot/login.html"] contents=$billingLogin }} on-error={{ :do {{ /file add name="flash/hotspot/login.html" contents=$billingLogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/login.html" }} }}; '
-            f':local billingAlogin "{alogin_html}"; '
-            f':do {{ /file set [find name="hotspot/alogin.html"] contents=$billingAlogin }} on-error={{ :do {{ /file add name="hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/alogin.html" }} }}; '
-            f':do {{ /file set [find name="flash/hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :do {{ /file add name="flash/hotspot/alogin.html" contents=$billingAlogin }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/alogin.html" }} }}; '
-            f':local billingRedirect "{redirect_html}"; '
-            f':do {{ /file set [find name="hotspot/redirect.html"] contents=$billingRedirect }} on-error={{ :do {{ /file add name="hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/redirect.html" }} }}; '
-            f':do {{ /file set [find name="flash/hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :do {{ /file add name="flash/hotspot/redirect.html" contents=$billingRedirect }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/redirect.html" }} }}; '
-            f':local billingError "{error_html}"; '
-            f':do {{ /file set [find name="hotspot/error.html"] contents=$billingError }} on-error={{ :do {{ /file add name="hotspot/error.html" contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/error.html" }} }}; '
-            f':do {{ /file set [find name="flash/hotspot/error.html" contents=$billingError }} on-error={{ :do {{ /file add name="flash/hotspot/error.html" contents=$billingError }} on-error={{ :log warning "Billing SaaS: failed to write flash/hotspot/error.html" }} }}; '
-            # Write minimal companion files that RouterOS hotspot server expects
-            f':do {{ /file add name="hotspot/status.html" contents="<html><body>Processing...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/status.html" }}; '
-            f':do {{ /file add name="hotspot/rlogin.html" contents="<html><body>Redirecting...</body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/rlogin.html" }}; '
-            f':do {{ /file add name="hotspot/radvert.html" contents="<html><body></body></html>" }} on-error={{ :log warning "Billing SaaS: failed to write hotspot/radvert.html" }}; '
+        hotspot_file_writes = routeros_hotspot_file_script(
+            {
+                "hotspot/login.html": hotspot_login_redirect_html(portal_url),
+                "hotspot/alogin.html": hotspot_alogin_redirect_html(portal_url),
+                "hotspot/redirect.html": hotspot_redirect_html(),
+                "hotspot/error.html": hotspot_error_redirect_html(portal_url),
+                "hotspot/status.html": "<html><body>Processing...</body></html>",
+                "hotspot/rlogin.html": "<html><body>Redirecting...</body></html>",
+                "hotspot/radvert.html": "<html><body></body></html>",
+            }
         )
 
     # --- Default PPPoE / Hotspot secret cleanup ---
