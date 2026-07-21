@@ -181,8 +181,17 @@ export default function Packages() {
   const syncPackage = async (pkg) => {
     setSyncingId(pkg.id);
     try {
-      await api.post(`/packages/${pkg.id}/sync`);
-      toast.success('Package profiles synced to MikroTik');
+      const { data } = await api.post(`/packages/${pkg.id}/sync`);
+      if (data?.success === false) {
+        toast.error(data?.message || 'Failed to sync package profile');
+      } else if (data?.queued) {
+        toast(
+          data?.message || 'Package sync queued — the router applies it on its next check-in (usually within 30s).',
+          { icon: '⏳' }
+        );
+      } else {
+        toast.success(data?.message || 'Package profile synced to MikroTik');
+      }
       await load();
     } catch (error) {
       toast.error(error.response?.data?.message || 'Failed to sync package profiles');
