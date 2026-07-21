@@ -717,7 +717,7 @@ def captive_hotspot_file(request, tenant_id, page):
     if not tenant:
         return HttpResponse("Not found", status=404, content_type="text/plain")
 
-    portal_url = captive_portal_url({"id": tenant_id, **tenant})
+    portal_url = captive_portal_url({"id": tenant_id, **tenant}, public_base_url(request).rstrip("/"))
     redirect_html = hotspot_redirect_html(portal_url)
     files = {
         "login.html": hotspot_login_redirect_html(portal_url),
@@ -1067,7 +1067,7 @@ def customer_provision(request, customer_id):
 def customer_hotspot_portal(request):
     tenant_id = request.tenant["id"]
     tenant = {"id": tenant_id, **request.tenant}
-    portal_url = captive_portal_url(tenant)
+    portal_url = captive_portal_url(tenant, public_base_url(request).rstrip("/"))
     return ok(
         {
             "tenant_id": tenant_id,
@@ -1224,7 +1224,7 @@ def router_ports(request):
     if request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"}:
         return _queue_router_port_command(request, interface_name, service_type, profile_name)
     try:
-        result = configure_router_port(request.tenant, interface_name, service_type, profile_name)
+        result = configure_router_port(request.tenant, interface_name, service_type, profile_name, base_url=public_base_url(request).rstrip("/"))
         assignments = dict(request.tenant.get("router_port_assignments") or {})
         assignments[interface_name] = {
             "service_type": service_type,
@@ -1253,7 +1253,7 @@ def _queue_router_port_command(request, interface_name, service_type, profile_na
         return ok({"message": "Port service must be either pppoe or hotspot"}, 400)
 
     tenant_id = request.tenant["id"]
-    portal_url = captive_portal_url({"id": tenant_id, **request.tenant}) if service_type == "hotspot" else None
+    portal_url = captive_portal_url({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/")) if service_type == "hotspot" else None
     bridge_name = mikrotik_managed_bridge_name(request.tenant)
     script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name)
 
@@ -1373,8 +1373,8 @@ def _package_profile_script(package):
     )
 
 
-def _hotspot_captive_file_script(tenant):
-    portal_url = captive_portal_url(tenant)
+def _hotspot_captive_file_script(tenant, base_url=None):
+    portal_url = captive_portal_url(tenant, base_url)
     return routeros_hotspot_fetch_script(portal_url, "Billing SaaS agent")
 
 
@@ -1617,7 +1617,7 @@ def router_provision_script(request, token):
 
     tenant = {"id": tenant_id, **tenant_data}
     app_base_url = public_base_url(request).rstrip("/")
-    portal_url = captive_portal_url(tenant)
+    portal_url = captive_portal_url(tenant, app_base_url)
     portal_host = urlparse(portal_url).netloc.split("@")[-1].split(":")[0]
     callback_base_url = f"{app_base_url}/api/router/provision/{token}/complete"
     snapshot_url = f"{app_base_url}/api/router/provision/{token}/snapshot"
@@ -1633,7 +1633,7 @@ def router_provision_script(request, token):
     def _rsc_escape(value):
         return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
-    hotspot_file_script = _hotspot_captive_file_script(tenant)
+    hotspot_file_script = _hotspot_captive_file_script(tenant, app_base_url)
     snapshot_script = _router_snapshot_fetch_script(snapshot_url)
 
     wg_server_public_key = str(os.getenv("WG_SERVER_PUBLIC_KEY") or tenant.get("wg_server_public_key") or "").strip()
@@ -2123,11 +2123,12 @@ def package_sync(request, package_id=None):
     packages_to_sync = list_children(f"tenants/{tenant_id}/packages") if package_id is None else [{"id": package_id, **(ref(f"tenants/{tenant_id}/packages/{package_id}").get() or {})}]
     if package_id and not packages_to_sync[0].get("name"):
         return ok({"message": "Package not found"}, 404)
+    app_base_url = public_base_url(request).rstrip("/")
     should_queue = request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or bool(request.tenant.get("mikrotik_last_seen_at"))
     if should_queue:
         script = "".join(_package_profile_script(pkg) for pkg in packages_to_sync)
         if any(package_service_type(pkg) == "hotspot" for pkg in packages_to_sync):
-            script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}) + script
+            script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}, app_base_url) + script
         if not script:
             return ok({"message": "No valid package profiles to sync"}, 400)
         package_ids = [pkg.get("id") for pkg in packages_to_sync if pkg.get("id")]
@@ -2159,7 +2160,7 @@ def package_sync(request, package_id=None):
                 script = _package_profile_script(pkg)
                 if script:
                     if package_service_type(pkg) == "hotspot":
-                        script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}) + script
+                        script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}, app_base_url) + script
                     _queue_router_command(request, {"type": "sync_packages", "script": script, "package_ids": [pkg["id"]]})
                     ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "queued", "ppp_profile_error": None, "ppp_profile_queued_at": iso_now()})
                     results.append({"id": pkg["id"], "name": pkg.get("name"), "success": True, "queued": True})

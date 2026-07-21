@@ -799,15 +799,26 @@ def package_service_type(package):
     return service_type if service_type in {"hotspot", "pppoe"} else "hotspot"
 
 
-def captive_portal_url(tenant):
+def captive_portal_url(tenant, base_url=None):
+    """Build the URL the router should use to fetch hotspot files / redirect users to.
+
+    base_url, when provided, should be the LIVE request host (e.g. from
+    public_base_url(request).rstrip("/")) — this always wins, since it's the only
+    value guaranteed to track a rotating local ngrok tunnel or the current
+    production domain. Env vars / cached tenant fields are only used as a
+    fallback for code paths with no request in scope (e.g. background tasks).
+    """
     tenant_id = (tenant or {}).get("id")
-    configured = (
-        os.getenv("CAPTIVE_PORTAL_PUBLIC_URL")
-        or (tenant or {}).get("captive_portal_public_url")
-        or os.getenv("SAAS_PORTAL_HOST")
-        or ""
-    )
-    base = normalize_public_url(configured) or get_public_base_url()
+    if base_url:
+        base = normalize_public_url(base_url)
+    else:
+        configured = (
+            os.getenv("CAPTIVE_PORTAL_PUBLIC_URL")
+            or (tenant or {}).get("captive_portal_public_url")
+            or os.getenv("SAAS_PORTAL_HOST")
+            or ""
+        )
+        base = normalize_public_url(configured) or get_public_base_url()
     path = urlparse(base).path.rstrip("/")
     if "{tenant_id}" in base:
         return base.replace("{tenant_id}", str(tenant_id))
@@ -818,8 +829,8 @@ def captive_portal_url(tenant):
     return f"{base}/api/captive/{tenant_id}"
 
 
-def captive_portal_host(tenant):
-    return urlparse(captive_portal_url(tenant)).netloc.split("@")[-1].split(":")[0]
+def captive_portal_host(tenant, base_url=None):
+    return urlparse(captive_portal_url(tenant, base_url)).netloc.split("@")[-1].split(":")[0]
 
 
 def mikrotik_managed_bridge_name(tenant=None):
@@ -944,16 +955,7 @@ def routeros_hotspot_fetch_script(portal_url, log_prefix="Billing SaaS"):
     separator = "&" if "?" in template_base else "?"
     skip_warning = "ngrok-skip-browser-warning=true" if urlparse(str(portal_url or "")).netloc.lower().endswith("ngrok-free.dev") else ""
     pages = ["login.html", "alogin.html", "redirect.html", "error.html", "status.html", "rlogin.html", "radvert.html"]
-    # /tool fetch will NOT create missing directories -- it silently fails
-    # (caught below by on-error) if "hotspot" or "flash/hotspot" don't
-    # already exist. Make sure both directories are present first, so the
-    # captive-portal page fetches below actually land on disk.
-    parts = [
-        f':do {{ :if ([:len [/file find name="hotspot" type=directory]] = 0) do={{ /file add name="hotspot" type=directory }} }} '
-        f'on-error={{ :log warning "{log_prefix}: failed to create hotspot directory" }};',
-        f':do {{ :if ([:len [/file find name="flash/hotspot" type=directory]] = 0) do={{ /file add name="flash/hotspot" type=directory }} }} '
-        f'on-error={{ :log warning "{log_prefix}: failed to create flash/hotspot directory" }};',
-    ]
+    parts = []
     for page in pages:
         src_url = f"{template_base}/{page}"
         if skip_warning:
@@ -996,12 +998,12 @@ def ensure_hotspot_login_redirect(api, portal_url):
     return pushed
 
 
-def ensure_hotspot_captive_portal(tenant):
+def ensure_hotspot_captive_portal(tenant, base_url=None):
     if not has_mikrotik_credentials(tenant):
         return None
 
-    portal_url = captive_portal_url(tenant)
-    portal_host = captive_portal_host(tenant)
+    portal_url = captive_portal_url(tenant, base_url)
+    portal_host = captive_portal_host(tenant, base_url)
     profile_name = "billing-saas-captive"
     api = router_connect(tenant)
     try:
@@ -1164,7 +1166,7 @@ def _clear_wireless_password_for_hotspot(api, interface_name):
         return None
 
 
-def configure_router_port(tenant, interface_name, service_type, profile_name="default"):
+def configure_router_port(tenant, interface_name, service_type, profile_name="default", base_url=None):
     service_type = str(service_type or "").lower().strip()
     if service_type not in {"pppoe", "hotspot"}:
         raise ValueError("Port service must be either pppoe or hotspot")
@@ -1212,7 +1214,7 @@ def configure_router_port(tenant, interface_name, service_type, profile_name="de
             api.path("interface", "pppoe-server", "server").add(**fields)
             return {"created": True, "service_type": service_type, "interface": interface_name, "bound_interface": bind_interface, "note": bridge_note}
 
-        captive = ensure_hotspot_captive_portal(tenant) or {}
+        captive = ensure_hotspot_captive_portal(tenant, base_url) or {}
         hotspot_profile = captive.get("profile") or "billing-saas-captive"
         api.path("interface").update(**{".id": interface[".id"], "comment": f"billing-saas:hotspot:portal={captive.get('portal_url') or ''}".strip()})
         
