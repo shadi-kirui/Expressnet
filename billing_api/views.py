@@ -70,6 +70,7 @@ from .services import (
     utcnow,
     verify_paystack_signature,
     verify_paystack_transaction,
+    walled_garden_hosts,
     write_audit_log,
 )
 
@@ -1255,7 +1256,7 @@ def _queue_router_port_command(request, interface_name, service_type, profile_na
     tenant_id = request.tenant["id"]
     portal_url = captive_portal_url({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/")) if service_type == "hotspot" else None
     bridge_name = mikrotik_managed_bridge_name(request.tenant)
-    script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name)
+    script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name, tenant=request.tenant)
 
     commands = [c for c in (request.tenant.get("pending_router_commands") or []) if c.get("status") == "pending"][-19:]
     commands.append({
@@ -1742,7 +1743,76 @@ def router_provision_script(request, token):
     tenant_obj.extra = {**existing_extra, "radius_shared_secret_pending": radius_shared_secret}
     tenant_obj.save(update_fields=["extra"])
 
-    script = f""":log info "Billing SaaS provisioning started";
+    # Build walled-garden lines from tenant's payment provider config
+    _wg_hosts = walled_garden_hosts(tenant, portal_host)
+    walled_garden_rsc = "".join(
+        f':do {{ /ip hotspot walled-garden add action=allow dst-host="{_rsc_escape(h)}" comment="billing-saas captive portal access" }} on-error={{}}\n'
+        for h in _wg_hosts
+    )
+
+    # P0 — Pre-flight guard: check RouterOS version (WireGuard needs >= 7.0),
+    # unsupported architectures, and internet connectivity before touching anything.
+    # On failure, :error aborts the script AND hits our callback so the dashboard
+    # shows *why* provisioning stopped instead of silently timing out.
+    preflight_guard_script = f""":log info "Billing SaaS: pre-flight checks";
+:local billingArch [/system resource get architecture-name];
+:local billingVer [/system resource get version];
+:local billingMajor 0;
+:local billingMinor 0;
+:foreach c in=[:toarray [:tostr $billingVer]] do={{
+    :if ([:typeof $c] = "num") do={{
+        :if ($billingMajor = 0) do={{ :set billingMajor $c }} else={{ :if ($billingMinor = 0) do={{ :set billingMinor $c }} }}
+    }}
+}};
+:if ($billingArch = "smips" || $billingArch = "mmips" || $billingArch = "arm") do={{
+    :log error "Billing SaaS: unsupported architecture ($billingArch)";
+    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=unsupported_arch:$billingArch") }} on-error={{}}
+    :error "Billing SaaS: unsupported device architecture $billingArch — this platform requires at least a MIPSBE or ARM64 board."
+}};
+:if ($billingMajor < 7) do={{
+    :log error "Billing SaaS: RouterOS $billingVer too old (need >= 7.0 for WireGuard)";
+    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=version_too_old:$billingVer") }} on-error={{}}
+    :error "Billing SaaS: RouterOS $billingVer is not supported — version 7.0 or later is required for WireGuard."
+}};
+:if ([/ping 8.8.8.8 count=3]=0) do={{
+    :log error "Billing SaaS: no internet connectivity detected";
+    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=no_internet") }} on-error={{}}
+    :error "Billing SaaS: no internet connectivity — please check WAN connection and try again."
+}};
+:log info "Billing SaaS: pre-flight checks passed (arch=$billingArch, ver=$billingVer)";
+"""
+
+    # P0 — Snapshot guard: export current config + binary backup before any changes,
+    # so a technician can restore manually if provisioning fails partway.
+    snapshot_guard_script = (
+        ':log info "Billing SaaS: snapshotting config before provisioning";\n'
+        ':do { /export file="billing-saas-pre-provision" } on-error={ :log warning "Billing SaaS: pre-provision export failed" }\n'
+        ':do { /system backup save name="billing-saas-pre-provision" } on-error={ :log warning "Billing SaaS: pre-provision backup failed" }\n'
+    )
+
+    # P1 — WireGuard watchdog: bounces the wg-saas interface if the server
+    # tunnel IP is unreachable for 10 consecutive 1s pings. Runs every 1 min.
+    wg_watchdog_script = ""
+    if vpn_peer_enabled:
+        wg_watchdog_script = f"""
+        :do {{ /system scheduler remove [find name="billing-saas-wg-watchdog"] }} on-error={{}}
+        /system scheduler add name="billing-saas-wg-watchdog" interval=1m on-event=":if ([/ping {_rsc_escape(wg_server_tunnel_ip)} count=10 interval=1s]=0) do={{ :log warning \\\"Billing SaaS: WireGuard tunnel unreachable, bouncing interface\\\"; /interface wireguard disable wg-saas; :delay 2s; /interface wireguard enable wg-saas }}"
+"""
+
+    # P2 — DNS flood cap on the hotspot bridge: rate-limit DNS queries to
+    # 100/s per source with a 200-packet burst and 1m bucket timeout, then
+    # drop excess UDP/53 and TCP/53 to protect low-end boards.
+    dns_flood_cap_script = f"""
+        :do {{ /ip firewall raw remove [find comment="billing-saas dns flood cap"] }} on-error={{}}
+        /ip firewall raw add chain=prerouting protocol=udp dst-port=53 in-interface=$billingBridge dst-limit=100/1s,200,src-address/1m action=accept comment="billing-saas dns flood cap"
+        /ip firewall raw add chain=prerouting protocol=udp dst-port=53 in-interface=$billingBridge action=drop comment="billing-saas dns flood cap"
+        /ip firewall raw add chain=prerouting protocol=tcp dst-port=53 in-interface=$billingBridge dst-limit=100/1s,200,src-address/1m action=accept comment="billing-saas dns flood cap"
+        /ip firewall raw add chain=prerouting protocol=tcp dst-port=53 in-interface=$billingBridge action=drop comment="billing-saas dns flood cap"
+"""
+
+    script = f"""{preflight_guard_script}
+{snapshot_guard_script}
+:log info "Billing SaaS provisioning started";
         {vpn_script}
         :log info "Billing SaaS: creating LAN bridge (no ports attached yet -- assign ports from the dashboard)";
         :local billingBridge "{_rsc_escape(bridge_name)}";
@@ -1794,11 +1864,7 @@ def router_provision_script(request, token):
         :do {{ /ip hotspot set [find name=billing-saas-hotspot] disabled=no }} on-error={{}}
         :do {{ /ip hotspot walled-garden remove [find comment="billing-saas captive portal access"] }} on-error={{}}
         :do {{ /ip hotspot walled-garden ip remove [find comment="billing-saas captive portal access"] }} on-error={{}}
-        :do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{}}
-        :do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
-        :do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
-        :do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
-        :do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
+{walled_garden_rsc}
         :local billingPortalIp "";
         :do {{ :set billingPortalIp [:resolve "{portal_host}"] }} on-error={{ :log warning "Billing SaaS portal DNS resolve failed" }}
         :if ([:len $billingPortalIp] > 0) do={{
@@ -1816,10 +1882,14 @@ def router_provision_script(request, token):
         :do {{ /tool fetch keep-result=no url=("{callback_url}{callback_join}wg_public_key=" . $billingWgPub . "&wg_tunnel_ip={_rsc_escape(wg_router_api_ip)}&bridge={_rsc_escape(bridge_name)}") }} on-error={{ :log warning "Billing SaaS provisioning callback failed" }}
         :do {{ /system scheduler remove [find name="billing-saas-agent"] }} on-error={{}}
         /system scheduler add name="billing-saas-agent" interval=30s on-event=":do {{ /file remove [find name=\\"billing-saas-cmd.rsc\\"] }} on-error={{}}; :do {{ /tool fetch url=\\"{agent_poll_url}\\" dst-path=billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command fetch failed\\" }}; :if ([:len [/file find name=\\"billing-saas-cmd.rsc\\"]] > 0) do={{ :do {{ /import billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command import failed\\" }} }};"
+{wg_watchdog_script}
+{dns_flood_cap_script}
         :log info "Billing SaaS provisioning complete. No ports were assigned -- open the dashboard, pull router ports, and assign each interface to Hotspot or PPPoE.";
         :put "Configuration completed successfully. No LAN ports were touched -- assign ports from the dashboard.";
         """
     return HttpResponse(script, content_type="text/plain")
+
+
 @csrf_exempt
 @api_view(["GET"])
 def router_agent_poll(request, token):
@@ -1974,6 +2044,19 @@ def router_provision_complete(request, token):
         or request.META.get("REMOTE_ADDR")
         or ""
     ).split(",")[0].strip()
+
+    # Handle pre-flight guard failure callbacks (status=unsupported)
+    preflight_status = str(request.GET.get("status") or "").strip().lower()
+    preflight_reason = str(request.GET.get("reason") or "").strip()
+    if preflight_status == "unsupported":
+        ref(f"tenants/{tenant_id}").update({
+            "mikrotik_provisioning_status": "unsupported",
+            "mikrotik_last_seen_at": iso_now(),
+            "mikrotik_last_seen_ip": client_ip,
+            "mikrotik_provision_error": preflight_reason or "unknown",
+        })
+        return ok({"status": "unsupported", "reason": preflight_reason})
+
     updates = {
         "mikrotik_provisioning_status": "completed",
         "mikrotik_provisioned_at": iso_now(),

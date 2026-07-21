@@ -963,9 +963,16 @@ def routeros_hotspot_fetch_script(portal_url, log_prefix="Billing SaaS"):
         src = _rsc_escape(src_url)
         for target_name in (f"hotspot/{page}", f"flash/hotspot/{page}"):
             dst = _rsc_escape(target_name)
+            # Retry-once with 3s delay — a flaky first connection silently
+            # leaves the captive portal broken until the next full re-sync.
             parts.append(
                 f':do {{ /tool fetch url="{src}" dst-path="{dst}" }} '
-                f'on-error={{ :log warning "{log_prefix}: failed to fetch {dst}" }};'
+                f'on-error={{ '
+                f'  :log warning "{log_prefix}: first fetch failed for {dst}, retrying in 3s"; '
+                f'  :delay 3s; '
+                f'  :do {{ /tool fetch url="{src}" dst-path="{dst}" }} '
+                f'  on-error={{ :log warning "{log_prefix}: retry also failed for {dst}" }} '
+                f'}};'
             )
     return " ".join(parts)
 
@@ -998,6 +1005,98 @@ def ensure_hotspot_login_redirect(api, portal_url):
     return pushed
 
 
+def walled_garden_hosts(tenant, portal_host=None):
+    """Return the list of dst-host entries for the hotspot walled garden.
+
+    Derives the list from the tenant's configured payment provider when
+    possible (stored in tenant.extra["payment_provider"]), and always
+    includes the captive portal host plus Cloudflare challenges domain
+    (many gateways use Turnstile on their checkout pages).
+
+    Supported payment_provider values:
+      - "paystack"   (default when Paystack keys are configured)
+      - "mpesa"      (M-Pesa STK push — no external hosts needed)
+      - "pesapal"
+      - "flutterwave"
+      - "paypal"
+      - "monnify"
+      - "payfast"
+    Falls back to a broad East-African default set when the provider is
+    unrecognised or not set.
+    """
+    if not portal_host:
+        portal_host = captive_portal_host(tenant)
+
+    provider = ""
+    if isinstance(tenant, dict):
+        provider = str(tenant.get("payment_provider") or tenant.get("extra", {}).get("payment_provider") or "").strip().lower()
+    else:
+        provider = str(getattr(tenant, "extra", None) and (getattr(tenant, "extra") or {}).get("payment_provider") or "").strip().lower()
+
+    # If no explicit provider, infer from configured keys
+    if not provider:
+        has_paystack = False
+        if isinstance(tenant, dict):
+            has_paystack = bool(tenant.get("paystack_secret_key"))
+        else:
+            has_paystack = bool(getattr(tenant, "paystack_secret_key", ""))
+        if has_paystack:
+            provider = "paystack"
+
+    # Always include these
+    hosts = [portal_host] if portal_host else []
+    hosts.append("challenges.cloudflare.com")
+
+    gateway_hosts = {
+        "paystack": [
+            "checkout.paystack.com",
+            "api.paystack.co",
+            "*.paystack.co",
+            "*.paystack.com",
+        ],
+        "pesapal": [
+            "*.pesapal.com",
+        ],
+        "flutterwave": [
+            "checkout.flutterwave.com",
+            "api.flutterwave.com",
+            "*.flutterwave.com",
+        ],
+        "paypal": [
+            "*.paypal.com",
+        ],
+        "monnify": [
+            "api.monnify.com",
+            "*.monnify.com",
+        ],
+        "payfast": [
+            "*.payfast.co.za",
+            "www.payfast.co.za",
+        ],
+        "mpesa": [
+            # M-Pesa STK push is mobile-initiated — no browser-based
+            # checkout hosts to whitelist.
+        ],
+    }
+
+    if provider in gateway_hosts:
+        hosts.extend(gateway_hosts[provider])
+    else:
+        # Broad default: include all common East-African gateways so no
+        # tenant is blocked regardless of which provider they pick later.
+        for gw_list in gateway_hosts.values():
+            hosts.extend(gw_list)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for h in hosts:
+        if h and h not in seen:
+            seen.add(h)
+            unique.append(h)
+    return unique
+
+
 def ensure_hotspot_captive_portal(tenant, base_url=None):
     if not has_mikrotik_credentials(tenant):
         return None
@@ -1019,13 +1118,7 @@ def ensure_hotspot_captive_portal(tenant, base_url=None):
                 "comment": f"billing-saas captive portal: {portal_url}",
             },
         )
-        for host in [
-            portal_host,
-            "checkout.paystack.com",
-            "api.paystack.co",
-            "*.paystack.co",
-            "*.paystack.com",
-        ]:
+        for host in walled_garden_hosts(tenant, portal_host):
             if not host:
                 continue
             upsert_router_item(
@@ -1240,7 +1333,7 @@ def _rsc_escape(value):
     return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
 
-def _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name=None):
+def _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name=None, tenant=None):
     bridge_name = bridge_name or mikrotik_managed_bridge_name()
     portal_comment = portal_url or ""
     portal_host = urlparse(portal_url or "").netloc.split("@")[-1].split(":")[0]
@@ -1265,11 +1358,10 @@ def _build_port_command_script(interface_name, service_type, profile_name, porta
         hotspot_setup = (
             f':do {{ /ip hotspot profile add name="billing-saas-captive" login-by=http-pap,http-chap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }} '
             f'on-error={{ /ip hotspot profile set [find name="billing-saas-captive"] login-by=http-pap,http-chap use-radius=yes radius-accounting=yes radius-interim-update=5m html-directory=hotspot comment="billing-saas captive portal: {portal_comment}" }}; '
-            f':do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
-            f':do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
-            f':do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
-            f':do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.co" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
-            f':do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.com" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+            + "".join(
+                f':do {{ /ip hotspot walled-garden add action=allow dst-host="{_rsc_escape(h)}" comment="billing-saas captive portal access" }} on-error={{ :log warning "Billing SaaS: walled-garden add failed" }}; '
+                for h in walled_garden_hosts(tenant, portal_host)
+            ) + ' '
             f':local billingPortalIp ""; '
             f':do {{ :set billingPortalIp [:resolve "{portal_host}"] }} on-error={{ :log warning "Billing SaaS portal DNS resolve failed" }}; '
             f':if ([:len $billingPortalIp] > 0) do={{ '
