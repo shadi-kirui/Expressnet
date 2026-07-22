@@ -7,7 +7,7 @@ import ssl
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import bcrypt
 import firebase_admin
@@ -951,15 +951,16 @@ def routeros_hotspot_file_script(files, log_prefix="Billing SaaS"):
 
 
 def routeros_hotspot_fetch_script(portal_url, log_prefix="Billing SaaS"):
-    template_base = str(portal_url or "").rstrip("/") + "/hotspot-file"
-    separator = "&" if "?" in template_base else "?"
-    skip_warning = "ngrok-skip-browser-warning=true" if urlparse(str(portal_url or "")).netloc.lower().endswith("ngrok-free.dev") else ""
+    parsed = urlsplit(str(portal_url or ""))
+    template_path = parsed.path.rstrip("/") + "/hotspot-file"
+    portal_base = urlunsplit((parsed.scheme, parsed.netloc, template_path, parsed.query, ""))
+    skip_warning = "ngrok-skip-browser-warning=true" if parsed.netloc.lower().endswith("ngrok-free.dev") else ""
     pages = ["login.html", "alogin.html", "redirect.html", "error.html", "status.html", "rlogin.html", "radvert.html"]
     parts = []
     for page in pages:
-        src_url = f"{template_base}/{page}"
+        src_url = f"{portal_base}/{page}" if not parsed.query else urlunsplit((parsed.scheme, parsed.netloc, f"{template_path}/{page}", parsed.query, ""))
         if skip_warning:
-            src_url = f"{src_url}{separator}{skip_warning}"
+            src_url = f"{src_url}{'&' if '?' in src_url else '?'}{skip_warning}"
         src = _rsc_escape(src_url)
         for target_name in (f"hotspot/{page}", f"flash/hotspot/{page}"):
             dst = _rsc_escape(target_name)

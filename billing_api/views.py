@@ -70,7 +70,6 @@ from .services import (
     utcnow,
     verify_paystack_signature,
     verify_paystack_transaction,
-    walled_garden_hosts,
     write_audit_log,
 )
 
@@ -250,6 +249,16 @@ def sync_package_profile(tenant, package):
     if service_type == "pppoe":
         return create_ppp_profile(tenant, package.get("name"), package.get("speed"))
     return create_hotspot_profile(tenant, package.get("name"), package.get("speed"))
+
+
+def _package_sync_script_for_request(request, package):
+    script = _package_profile_script(package)
+    if script and package_service_type(package) == "hotspot":
+        script = _hotspot_captive_file_script(
+            {"id": request.tenant["id"], **request.tenant},
+            public_base_url(request).rstrip("/"),
+        ) + script
+    return script
 
 
 def package_duration_label(package):
@@ -1106,12 +1115,14 @@ def packages(request, package_id=None):
         if has_mikrotik_credentials(request.tenant):
             package_for_router = {"id": package_id, **existing, **updates}
             if request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or request.tenant.get("mikrotik_last_seen_at"):
-                script = _package_profile_script(package_for_router)
+                script = _package_sync_script_for_request(request, package_for_router)
                 if script:
-                    _queue_router_command(request, {"type": "sync_packages", "script": script})
+                    _queue_router_command(request, {"type": "sync_packages", "script": script, "package_ids": [package_id]})
                     router_updates.update({"ppp_profile_status": "queued", "ppp_profile_queued_at": iso_now(), "ppp_profile_error": None})
             else:
                 try:
+                    if package_service_type(package_for_router) == "hotspot":
+                        ensure_hotspot_captive_portal({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/"))
                     sync_package_profile(request.tenant, package_for_router)
                     router_updates.update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
                 except Exception as exc:
@@ -1144,6 +1155,8 @@ def package_add(request):
             router_queued = True
         else:
             try:
+                if package_service_type({**data, **package_payload}) == "hotspot":
+                    ensure_hotspot_captive_portal({"id": request.tenant["id"], **request.tenant}, public_base_url(request).rstrip("/"))
                 sync_package_profile(request.tenant, {**data, **package_payload})
                 router_synced = True
             except Exception as exc:
@@ -1163,7 +1176,7 @@ def package_add(request):
         }
     )
     if router_queued:
-        _queue_router_command(request, {"type": "sync_packages", "script": _package_profile_script({"id": new_ref.key, **data, **package_payload}), "package_ids": [new_ref.key]})
+        _queue_router_command(request, {"type": "sync_packages", "script": _package_sync_script_for_request(request, {"id": new_ref.key, **data, **package_payload}), "package_ids": [new_ref.key]})
     message = "Package and MikroTik profile created" if router_synced else "Package created and queued for MikroTik sync" if router_queued else "Package created. Sync router after MikroTik is connected."
     return ok({"success": True, "message": message, "packageId": new_ref.key}, 201)
 
@@ -1256,7 +1269,7 @@ def _queue_router_port_command(request, interface_name, service_type, profile_na
     tenant_id = request.tenant["id"]
     portal_url = captive_portal_url({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/")) if service_type == "hotspot" else None
     bridge_name = mikrotik_managed_bridge_name(request.tenant)
-    script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name, tenant=request.tenant)
+    script = _build_port_command_script(interface_name, service_type, profile_name, portal_url, bridge_name)
 
     commands = [c for c in (request.tenant.get("pending_router_commands") or []) if c.get("status") == "pending"][-19:]
     commands.append({
@@ -1363,14 +1376,16 @@ def _package_profile_script(package):
             f':if ([:len [/ppp profile find name="{name}"]] = 0) do={{'
             f' /ppp profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
             f'else={{ /ppp profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }}; '
-            f'}} on-error={{ :log warning "Billing SaaS agent: PPPoE profile sync failed for {name}" }};'
+            f'}} on-error={{ :log warning "Billing SaaS agent: PPPoE profile sync failed for {name}"; :error "PPPoE profile sync failed for {name}" }};'
+            f':if ([:len [/ppp profile find name="{name}"]] = 0) do={{ :error "PPPoE profile missing after sync: {name}" }};'
         )
     return (
         f':do {{ '
         f':if ([:len [/ip hotspot user profile find name="{name}"]] = 0) do={{'
-        f' /ip hotspot user profile add name="{name}"{rate_limit_field} comment="billing-saas-package" }} '
-        f'else={{ /ip hotspot user profile set [find name="{name}"]{rate_limit_field} comment="billing-saas-package" }}; '
-        f'}} on-error={{ :log warning "Billing SaaS agent: Hotspot profile sync failed for {name}" }};'
+        f' /ip hotspot user profile add name="{name}"{rate_limit_field} }} '
+        f'else={{ /ip hotspot user profile set [find name="{name}"]{rate_limit_field} }}; '
+        f'}} on-error={{ :log warning "Billing SaaS agent: Hotspot profile sync failed for {name}"; :error "Hotspot profile sync failed for {name}" }};'
+        f':if ([:len [/ip hotspot user profile find name="{name}"]] = 0) do={{ :error "Hotspot profile missing after sync: {name}" }};'
     )
 
 
@@ -1612,7 +1627,14 @@ def router_provision_script(request, token):
         return HttpResponse("Unauthorized: Invalid token assignment.", status=401, content_type="text/plain")
 
     tenant_id = str(payload.get("tenant_id") or "")
-    tenant_data = ref(f"tenants/{tenant_id}").get()
+    try:
+        tenant_data = ref(f"tenants/{tenant_id}").get()
+    except OperationalError:
+        close_old_connections()
+        try:
+            tenant_data = ref(f"tenants/{tenant_id}").get()
+        except OperationalError:
+            return HttpResponse(':log warning "Billing SaaS provisioning: app database is temporarily unreachable";\n', content_type="text/plain")
     if not tenant_data:
         return HttpResponse("Not Found: Tenant account profile was not located.", status=404, content_type="text/plain")
 
@@ -1679,17 +1701,34 @@ def router_provision_script(request, token):
         :do {{ /ip firewall filter add chain=input action=accept in-interface=wg-saas protocol=tcp dst-port=8728 comment="billing-saas allow api over vpn" }} on-error={{}}
         """
 
-    ref(f"tenants/{tenant_id}").update({
-        "mikrotik_provisioning_status": "script_downloaded",
-        "mikrotik_script_downloaded_at": iso_now(),
-        "mikrotik_vpn_enabled": True,
-        "mikrotik_vpn_peer_enabled": vpn_peer_enabled,
-        "mikrotik_vpn_tunnel_ip": wg_router_tunnel_ip,
-        "mikrotik_host": wg_router_api_ip,
-        "mikrotik_port": int(tenant.get("mikrotik_port") or 8728),
-        "mikrotik_bridge_name": bridge_name,
-        "mikrotik_wan_interface": wan_interface,
-    })
+    try:
+        ref(f"tenants/{tenant_id}").update({
+            "mikrotik_provisioning_status": "script_downloaded",
+            "mikrotik_script_downloaded_at": iso_now(),
+            "mikrotik_vpn_enabled": True,
+            "mikrotik_vpn_peer_enabled": vpn_peer_enabled,
+            "mikrotik_vpn_tunnel_ip": wg_router_tunnel_ip,
+            "mikrotik_host": wg_router_api_ip,
+            "mikrotik_port": int(tenant.get("mikrotik_port") or 8728),
+            "mikrotik_bridge_name": bridge_name,
+            "mikrotik_wan_interface": wan_interface,
+        })
+    except OperationalError:
+        close_old_connections()
+        try:
+            ref(f"tenants/{tenant_id}").update({
+                "mikrotik_provisioning_status": "script_downloaded",
+                "mikrotik_script_downloaded_at": iso_now(),
+                "mikrotik_vpn_enabled": True,
+                "mikrotik_vpn_peer_enabled": vpn_peer_enabled,
+                "mikrotik_vpn_tunnel_ip": wg_router_tunnel_ip,
+                "mikrotik_host": wg_router_api_ip,
+                "mikrotik_port": int(tenant.get("mikrotik_port") or 8728),
+                "mikrotik_bridge_name": bridge_name,
+                "mikrotik_wan_interface": wan_interface,
+            })
+        except OperationalError:
+            pass
 
    
     interface_report_loop = f"""
@@ -1743,76 +1782,18 @@ def router_provision_script(request, token):
     tenant_obj.extra = {**existing_extra, "radius_shared_secret_pending": radius_shared_secret}
     tenant_obj.save(update_fields=["extra"])
 
-    # Build walled-garden lines from tenant's payment provider config
-    _wg_hosts = walled_garden_hosts(tenant, portal_host)
-    walled_garden_rsc = "".join(
-        f':do {{ /ip hotspot walled-garden add action=allow dst-host="{_rsc_escape(h)}" comment="billing-saas captive portal access" }} on-error={{}}\n'
-        for h in _wg_hosts
-    )
-
-    # P0 — Pre-flight guard: check RouterOS version (WireGuard needs >= 7.0),
-    # unsupported architectures, and internet connectivity before touching anything.
-    # On failure, :error aborts the script AND hits our callback so the dashboard
-    # shows *why* provisioning stopped instead of silently timing out.
-    preflight_guard_script = f""":log info "Billing SaaS: pre-flight checks";
-:local billingArch [/system resource get architecture-name];
-:local billingVer [/system resource get version];
-:local billingMajor 0;
-:local billingMinor 0;
-:foreach c in=[:toarray [:tostr $billingVer]] do={{
-    :if ([:typeof $c] = "num") do={{
-        :if ($billingMajor = 0) do={{ :set billingMajor $c }} else={{ :if ($billingMinor = 0) do={{ :set billingMinor $c }} }}
-    }}
-}};
-:if ($billingArch = "smips" || $billingArch = "mmips" || $billingArch = "arm") do={{
-    :log error "Billing SaaS: unsupported architecture ($billingArch)";
-    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=unsupported_arch:$billingArch") }} on-error={{}}
-    :error "Billing SaaS: unsupported device architecture $billingArch — this platform requires at least a MIPSBE or ARM64 board."
-}};
-:if ($billingMajor < 7) do={{
-    :log error "Billing SaaS: RouterOS $billingVer too old (need >= 7.0 for WireGuard)";
-    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=version_too_old:$billingVer") }} on-error={{}}
-    :error "Billing SaaS: RouterOS $billingVer is not supported — version 7.0 or later is required for WireGuard."
-}};
-:if ([/ping 8.8.8.8 count=3]=0) do={{
-    :log error "Billing SaaS: no internet connectivity detected";
-    :do {{ /tool fetch keep-result=no url=("{callback_url}&status=unsupported&reason=no_internet") }} on-error={{}}
-    :error "Billing SaaS: no internet connectivity — please check WAN connection and try again."
-}};
-:log info "Billing SaaS: pre-flight checks passed (arch=$billingArch, ver=$billingVer)";
-"""
-
-    # P0 — Snapshot guard: export current config + binary backup before any changes,
-    # so a technician can restore manually if provisioning fails partway.
-    snapshot_guard_script = (
-        ':log info "Billing SaaS: snapshotting config before provisioning";\n'
-        ':do { /export file="billing-saas-pre-provision" } on-error={ :log warning "Billing SaaS: pre-provision export failed" }\n'
-        ':do { /system backup save name="billing-saas-pre-provision" } on-error={ :log warning "Billing SaaS: pre-provision backup failed" }\n'
-    )
-
-    # P1 — WireGuard watchdog: bounces the wg-saas interface if the server
-    # tunnel IP is unreachable for 10 consecutive 1s pings. Runs every 1 min.
-    wg_watchdog_script = ""
-    if vpn_peer_enabled:
-        wg_watchdog_script = f"""
-        :do {{ /system scheduler remove [find name="billing-saas-wg-watchdog"] }} on-error={{}}
-        /system scheduler add name="billing-saas-wg-watchdog" interval=1m on-event=":if ([/ping {_rsc_escape(wg_server_tunnel_ip)} count=10 interval=1s]=0) do={{ :log warning \\\"Billing SaaS: WireGuard tunnel unreachable, bouncing interface\\\"; /interface wireguard disable wg-saas; :delay 2s; /interface wireguard enable wg-saas }}"
-"""
-
-    # P2 — DNS flood cap on the hotspot bridge: rate-limit DNS queries to
-    # 100/s per source with a 200-packet burst and 1m bucket timeout, then
-    # drop excess UDP/53 and TCP/53 to protect low-end boards.
-    dns_flood_cap_script = f"""
-        :do {{ /ip firewall raw remove [find comment="billing-saas dns flood cap"] }} on-error={{}}
-        /ip firewall raw add chain=prerouting protocol=udp dst-port=53 in-interface=$billingBridge dst-limit=100/1s,200,src-address/1m action=accept comment="billing-saas dns flood cap"
-        /ip firewall raw add chain=prerouting protocol=udp dst-port=53 in-interface=$billingBridge action=drop comment="billing-saas dns flood cap"
-        /ip firewall raw add chain=prerouting protocol=tcp dst-port=53 in-interface=$billingBridge dst-limit=100/1s,200,src-address/1m action=accept comment="billing-saas dns flood cap"
-        /ip firewall raw add chain=prerouting protocol=tcp dst-port=53 in-interface=$billingBridge action=drop comment="billing-saas dns flood cap"
-"""
-
-    script = f"""{preflight_guard_script}
-{snapshot_guard_script}
-:log info "Billing SaaS provisioning started";
+    script = f""":log info "Billing SaaS provisioning started";
+        :local billingVer [/system resource get version];
+        :local billingVerNum $billingVer;
+        :local billingSpaceIdx [:find $billingVer " "];
+        :if ([:len $billingSpaceIdx] > 0) do={{ :set billingVerNum [:pick $billingVer 0 $billingSpaceIdx] }}
+        :local billingDot1 [:find $billingVerNum "."];
+        :local billingMajor 0;
+        :if ([:len $billingDot1] > 0) do={{ :set billingMajor [:tonum [:pick $billingVerNum 0 $billingDot1]] }} else={{ :set billingMajor [:tonum $billingVerNum] }}
+        :if ($billingMajor < 7) do={{
+            :do {{ /tool fetch keep-result=no url=("{callback_url}{callback_join}status=unsupported&reason=" . "RouterOS_" . $billingVerNum . "_requires_7_or_later_for_WireGuard") }} on-error={{}}
+            :error ("Billing SaaS: RouterOS " . $billingVer . " is not supported -- version 7.0 or later is required for WireGuard.");
+        }}
         {vpn_script}
         :log info "Billing SaaS: creating LAN bridge (no ports attached yet -- assign ports from the dashboard)";
         :local billingBridge "{_rsc_escape(bridge_name)}";
@@ -1864,7 +1845,11 @@ def router_provision_script(request, token):
         :do {{ /ip hotspot set [find name=billing-saas-hotspot] disabled=no }} on-error={{}}
         :do {{ /ip hotspot walled-garden remove [find comment="billing-saas captive portal access"] }} on-error={{}}
         :do {{ /ip hotspot walled-garden ip remove [find comment="billing-saas captive portal access"] }} on-error={{}}
-{walled_garden_rsc}
+        :do {{ /ip hotspot walled-garden add action=allow dst-host="{portal_host}" comment="billing-saas captive portal access" }} on-error={{}}
+        :do {{ /ip hotspot walled-garden add action=allow dst-host="checkout.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
+        :do {{ /ip hotspot walled-garden add action=allow dst-host="api.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
+        :do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.co" comment="billing-saas captive portal access" }} on-error={{}}
+        :do {{ /ip hotspot walled-garden add action=allow dst-host="*.paystack.com" comment="billing-saas captive portal access" }} on-error={{}}
         :local billingPortalIp "";
         :do {{ :set billingPortalIp [:resolve "{portal_host}"] }} on-error={{ :log warning "Billing SaaS portal DNS resolve failed" }}
         :if ([:len $billingPortalIp] > 0) do={{
@@ -1882,14 +1867,10 @@ def router_provision_script(request, token):
         :do {{ /tool fetch keep-result=no url=("{callback_url}{callback_join}wg_public_key=" . $billingWgPub . "&wg_tunnel_ip={_rsc_escape(wg_router_api_ip)}&bridge={_rsc_escape(bridge_name)}") }} on-error={{ :log warning "Billing SaaS provisioning callback failed" }}
         :do {{ /system scheduler remove [find name="billing-saas-agent"] }} on-error={{}}
         /system scheduler add name="billing-saas-agent" interval=30s on-event=":do {{ /file remove [find name=\\"billing-saas-cmd.rsc\\"] }} on-error={{}}; :do {{ /tool fetch url=\\"{agent_poll_url}\\" dst-path=billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command fetch failed\\" }}; :if ([:len [/file find name=\\"billing-saas-cmd.rsc\\"]] > 0) do={{ :do {{ /import billing-saas-cmd.rsc }} on-error={{ :log warning \\"Billing SaaS agent: command import failed\\" }} }};"
-{wg_watchdog_script}
-{dns_flood_cap_script}
         :log info "Billing SaaS provisioning complete. No ports were assigned -- open the dashboard, pull router ports, and assign each interface to Hotspot or PPPoE.";
         :put "Configuration completed successfully. No LAN ports were touched -- assign ports from the dashboard.";
         """
     return HttpResponse(script, content_type="text/plain")
-
-
 @csrf_exempt
 @api_view(["GET"])
 def router_agent_poll(request, token):
@@ -1904,7 +1885,11 @@ def router_agent_poll(request, token):
     try:
         tenant = ref(f"tenants/{tenant_id}").get()
     except OperationalError:
-        return HttpResponse(':log warning "Billing SaaS agent: app database is temporarily unreachable";\n', status=503, content_type="text/plain")
+        close_old_connections()
+        try:
+            tenant = ref(f"tenants/{tenant_id}").get()
+        except OperationalError:
+            return HttpResponse(':log warning "Billing SaaS agent: app database is temporarily unreachable";\n', content_type="text/plain")
     if not tenant:
         return HttpResponse("# Unknown tenant\n", status=404, content_type="text/plain")
 
@@ -1938,18 +1923,20 @@ def router_agent_poll(request, token):
         if not script:
             lines.append(f':log warning "Billing SaaS agent: command {command_id} had no script";')
             continue
+        post_script = ""
+        if command.get("type") == "sync_packages":
+            snapshot_base = f"{base_url}/api/router/provision/{token}/snapshot"
+            post_script = (
+                f':foreach p in=[/ppp profile find] do={{ :do {{ /tool fetch keep-result=no url=("{snapshot_base}/pppoe-profile?name=" . [/ppp profile get $p name] . "&rate_limit=" . [/ppp profile get $p rate-limit]) }} on-error={{}} }}; '
+                f':foreach p in=[/ip hotspot user profile find] do={{ :do {{ /tool fetch keep-result=no url=("{snapshot_base}/hotspot-profile?name=" . [/ip hotspot user profile get $p name] . "&rate_limit=" . [/ip hotspot user profile get $p rate-limit]) }} on-error={{}} }}; '
+                f':local billingHsFileCount [:len [/file find name~"hotspot"]]; '
+                f':do {{ /tool fetch keep-result=no url=("{snapshot_base}/hotspot-files-check?count=" . $billingHsFileCount) }} on-error={{}}; '
+            )
         lines.append(f':log info "Billing SaaS agent: running command {command_id} ({command.get("type") or "router"})";')
         lines.append(
-            f':do {{ {script}; /tool fetch keep-result=no url="{base_url}/api/router/agent/{token}/ack/{command_id}" }} '
+            f':do {{ {script}; {post_script}/tool fetch keep-result=no url="{base_url}/api/router/agent/{token}/ack/{command_id}" }} '
             f'on-error={{ :log warning "Billing SaaS agent: command {command_id} failed" }}'
         )
-        if command.get("type") == "sync_packages":
-            package_ids = command.get("package_ids") or ([command.get("package_id")] if command.get("package_id") else [])
-            for package_id_value in package_ids:
-                ref(f"tenants/{tenant_id}/packages/{package_id_value}").update({
-                    "ppp_profile_status": "delivered",
-                    "ppp_profile_delivered_at": delivered_at,
-                })
     assignments = dict(tenant.get("router_port_assignments") or {})
     for command in all_commands:
         if command.get("id") not in delivered_ids or command.get("status") not in {"pending", "delivered"}:
@@ -2044,19 +2031,6 @@ def router_provision_complete(request, token):
         or request.META.get("REMOTE_ADDR")
         or ""
     ).split(",")[0].strip()
-
-    # Handle pre-flight guard failure callbacks (status=unsupported)
-    preflight_status = str(request.GET.get("status") or "").strip().lower()
-    preflight_reason = str(request.GET.get("reason") or "").strip()
-    if preflight_status == "unsupported":
-        ref(f"tenants/{tenant_id}").update({
-            "mikrotik_provisioning_status": "unsupported",
-            "mikrotik_last_seen_at": iso_now(),
-            "mikrotik_last_seen_ip": client_ip,
-            "mikrotik_provision_error": preflight_reason or "unknown",
-        })
-        return ok({"status": "unsupported", "reason": preflight_reason})
-
     updates = {
         "mikrotik_provisioning_status": "completed",
         "mikrotik_provisioned_at": iso_now(),
@@ -2206,12 +2180,11 @@ def package_sync(request, package_id=None):
     packages_to_sync = list_children(f"tenants/{tenant_id}/packages") if package_id is None else [{"id": package_id, **(ref(f"tenants/{tenant_id}/packages/{package_id}").get() or {})}]
     if package_id and not packages_to_sync[0].get("name"):
         return ok({"message": "Package not found"}, 404)
-    app_base_url = public_base_url(request).rstrip("/")
     should_queue = request.tenant.get("mikrotik_provisioning_status") in {"script_downloaded", "completed"} or bool(request.tenant.get("mikrotik_last_seen_at"))
     if should_queue:
         script = "".join(_package_profile_script(pkg) for pkg in packages_to_sync)
         if any(package_service_type(pkg) == "hotspot" for pkg in packages_to_sync):
-            script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}, app_base_url) + script
+            script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/")) + script
         if not script:
             return ok({"message": "No valid package profiles to sync"}, 400)
         package_ids = [pkg.get("id") for pkg in packages_to_sync if pkg.get("id")]
@@ -2235,15 +2208,15 @@ def package_sync(request, package_id=None):
     results = []
     for pkg in packages_to_sync:
         try:
+            if package_service_type(pkg) == "hotspot":
+                ensure_hotspot_captive_portal({"id": tenant_id, **request.tenant}, public_base_url(request).rstrip("/"))
             sync_package_profile(request.tenant, pkg)
             ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "synced", "ppp_profile_synced_at": iso_now(), "ppp_profile_error": None})
             results.append({"id": pkg["id"], "name": pkg["name"], "success": True})
         except Exception as exc:
             if request.tenant.get("mikrotik_last_seen_at"):
-                script = _package_profile_script(pkg)
+                script = _package_sync_script_for_request(request, pkg)
                 if script:
-                    if package_service_type(pkg) == "hotspot":
-                        script = _hotspot_captive_file_script({"id": tenant_id, **request.tenant}, app_base_url) + script
                     _queue_router_command(request, {"type": "sync_packages", "script": script, "package_ids": [pkg["id"]]})
                     ref(f"tenants/{tenant_id}/packages/{pkg['id']}").update({"ppp_profile_status": "queued", "ppp_profile_error": None, "ppp_profile_queued_at": iso_now()})
                     results.append({"id": pkg["id"], "name": pkg.get("name"), "success": True, "queued": True})
