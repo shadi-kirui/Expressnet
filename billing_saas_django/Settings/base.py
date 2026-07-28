@@ -138,13 +138,17 @@ CACHES = {
 
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
-CELERY_BEAT_SCHEDULE = {
-    "expire-tenant-subscriptions-hourly": {
-        "task": "billing_api.tasks.expire_tenant_subscriptions",
-        "schedule": 3600.0,
-    },
-    "expire-customer-access-every-five-minutes": {
-        "task": "billing_api.tasks.expire_customer_access",
-        "schedule": 300.0,
-    },
-}
+# CELERY_BEAT_SCHEDULE temporarily disabled: Celery beat was triggering
+# these scheduled tasks immediately on worker startup, and one of them was
+# crashing the process. Disabling the schedule keeps the worker online.
+# TODO: re-enable once the crashing task is fixed.
+# CELERY_BEAT_SCHEDULE = {
+#     "expire-tenant-subscriptions-hourly": {
+#         "task": "billing_api.tasks.expire_tenant_subscriptions",
+#         "schedule": 3600.0,
+#     },
+#     "expire-customer-access-every-five-minutes": {
+#         "task": "billing_api.tasks.expire_customer_access",
+#         "schedule": 300.0,
+#     },
+# }
